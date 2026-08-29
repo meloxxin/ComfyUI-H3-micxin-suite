@@ -1,0 +1,8 @@
+# Core (usually provided by ComfyUI, listed for completeness)
+torch
+numpy
+Pillow
+
+# H3-helper specific
+av
+typing_extensions
