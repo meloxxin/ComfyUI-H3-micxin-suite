@@ -126,7 +126,7 @@ class H3ReferenceBuilder:
                 "video_path": (choices if choices else ["(no videos found)"], {
                     "default": choices[0] if choices else "",
                     "tooltip": "上一段视频的输出路径（VHS_VideoCombine 默认在 output/video/）。"
-                               "或者直接粘绝对路径如 J:\\aki\\ComfyUI\\output\\video\\xxx.mp4。"}),
+                               "或者直接粘绝对路径如 C:\\ComfyUI\\output\\video\\xxx.mp4。"}),
                 "mode": (["last_frame", "first_frame", "first_last",
                           "quarter_frames", "scene_grid"], {
                     "default": "last_frame",
