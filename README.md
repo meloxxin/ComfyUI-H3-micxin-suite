@@ -115,11 +115,19 @@ A: 可以。AutoDirector 负责提示词写作，H3-helper 负责模型加载。
 
 | 文件 | 说明 |
 |---|---|
-| `H3_R2VA_AIO_micxin_example.json` | H3 R2VA AIO 完整示例：咖啡杯特写 + 关键帧音频驱动。使用官方 int8 UNet + 4步加速 LoRA + MiniMax 8B LLM + 普通 CLIP 32B。 |
+| `H3_R2VA_AIO_micxin_example.json` | H3 R2VA AIO 完整示例：咖啡杯特写 + 关键帧音频驱动。使用官方 int8 UNet + 4步加速 LoRA + MiniMax 8B LLM + 普通 CLIP 32B。**仅依赖本套件节点，可直接运行。** |
+| `H3_Extender_one_click_drama_example.json` | 一键短剧示例（基于 Extender 长视频链式生成）。展示 H3StorySetup → H3AssetLibrary → H3PromptSplit → MiniMaxH3Extender 的完整短剧流水线。**需要额外安装 Extender 节点（非本套件），详见下方说明。** |
 | `assets/example_keyframe_coffee.jpg` | 示例关键帧图片（咖啡杯特写） |
 | `assets/example_audio_jazz.wav` | 示例音频驱动（爵士乐片段） |
 
 **使用方法**：将 `assets/` 下的示例文件复制到 `ComfyUI/input/` 目录，然后加载工作流即可直接运行。
+
+### 关于一键短剧示例工作流的说明
+
+- **角色名均为虚构**：工作流中的"霞姐""德叔""阿Yan"等角色名均为虚构示例，不指代任何真实人物，可随意替换为你自己的角色设定。
+- **参考图路径已清空**：所有角色/场景参考图的本地路径已清空，使用时需在 `H3AssetLibrary` 或对应节点中自行上传参考图。
+- **依赖额外节点**：该工作流使用 `MiniMaxH3Extender`、`MiniMaxH3MotionContextDiskFinalDecode`、`MiniMaxH3ReferencePackBridge`、`MiniMaxH3PromptPackBridge` 等节点，**这些节点不属于本套件**，需自行安装对应的 Extender 节点包（基于 ComfyUI-H3-Motion-Context 生态，部分版本可能为付费或私有分发）。
+- **已知缺陷**：一键 Extender 方案存在角色一致性差、场景连贯性弱、口型不稳定、显存占用极高、黑盒难调试、依赖链脆弱等问题（详见下方"一键短剧的已知缺陷"）。建议进阶用户使用，新手推荐从 `H3_R2VA_AIO_micxin_example.json` 单镜头工作流入手。
 
 ## 关于 MiniMax H3 Extender（非本套件节点）
 
