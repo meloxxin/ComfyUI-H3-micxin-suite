@@ -301,7 +301,7 @@ def _extract_shots(text):
         try:
             data = json.loads(cand)
         except json.JSONDecodeError as e:
-            # Second chance: abliterated / uncensored local models frequently
+            # Second chance: some uncensored local models frequently
             # emit REAL newlines (or other control characters) inside JSON
             # string literals, which standard json.loads rejects with
             # "Expecting value". strict=False tolerates those control chars so
@@ -361,7 +361,7 @@ def _extract_shots(text):
 
 # ---------------------------------------------------------------------------
 # Local GGUF backend — load the model INSIDE ComfyUI via llama-cpp-python, so
-# the node needs NO external server (no K:\llamacuda131 llama-server). This
+# the node needs NO external server (no standalone llama-server). This
 # mirrors the proven "Llama-cpp Instruct" node's loader: same Llama() params
 # + Qwen3VLChatHandler(mmproj, force_reasoning=False) for correct Qwen3-VL
 # chat formatting and thinking OFF. The loaded instance is cached and can be
@@ -1215,7 +1215,7 @@ class H3PromptWriter:
                 "backend": (["Local GGUF", "HTTP endpoint"], {
                     "default": "Local GGUF",
                     "tooltip": "Local GGUF: 在 ComfyUI 内直接加载 GGUF（推荐，默认）。"
-                               "HTTP endpoint: 调 OpenAI 兼容的外部服务（如 K:\\llamacuda131 llama-server）。"}),
+                               "HTTP endpoint: 调 OpenAI 兼容的外部服务（如本地 llama-server）。"}),
                 "gguf_name": ([""] + (_list_llm_files(False) or []), {
                     "default": _default_gguf(),
                     "tooltip": "Local GGUF 模式下加载哪个 GGUF（在 ComfyUI/models/LLM 下）。留空则不加载本地模型。"}),
@@ -1241,7 +1241,7 @@ class H3PromptWriter:
                     "tooltip": "backend='HTTP endpoint' 时使用。Local GGUF 自动忽略。"
                                "支持 OpenAI 兼容端点：Ollama / SiliconFlow / OpenAI / DeepSeek ...。"}),
                 "model": ("STRING", {
-                    "default": "Qwen3-VL-8B-Instruct-abliterated-v2.0.Q4_K_M",
+                    "default": "",
                     "placeholder": "llama.cpp model id / GGUF basename",
                     "tooltip": "endpoint 用的模型 id（llama.cpp 用 GGUF basename，"
                                "Ollama 用 qwen2.5:14b，云端用 deepseek-v3 等）。"}),
@@ -1391,7 +1391,7 @@ class H3PromptWriter:
               advanced_settings=False,
               # 5) HTTP 模式才显示
               llm_base_url="http://127.0.0.1:8080/v1/chat/completions",
-              model="Qwen3-VL-8B-Instruct-abliterated-v2.0.Q4_K_M",
+              model="",
               api_key="",
               # 6) LLM 写入参数（v8 删 auto_save / filename / n_ctx）
               temperature=0.65, seed=0,
