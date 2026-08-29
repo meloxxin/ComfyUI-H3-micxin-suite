@@ -1,0 +1,7 @@
+{
+  "display_name": "示例：电影感 vlog 开场",
+  "key": "example_cinematic_vlog",
+  "standalone": false,
+  "style_contract": "Cinematic live-action",
+  "system_prompt": "## Style Overlay Rules — Cinematic Vlog Opener\n\nThis mode generates prompts for a cinematic live-action vlog opener. Apply these rules (write descriptions in English):\n\n1. **Visual style**: \"Cinematic live-action vlog\". Warm natural lighting, shallow depth-of-field, subtle film grain.\n2. **Subject**: a friendly host or creator addressing the camera directly. Keep their look consistent across shots.\n3. **Setting**: aspirational everyday location — café, city street, home studio, rooftop, park. Establish location in [Shot 1].\n4. **Camera**: handheld or gimbal-stabilized. Gentle push-in on the host, slow revealing movement. Avoid static wide shots.\n5. **Energy**: upbeat, personal, conversational. The host smiles or shows genuine expression.\n6. **Audio**: ambient location sound (café chatter, city rumble, breeze). Non-diegetic music: light acoustic / lo-fi background, moderate tempo.\n7. **Length**: 4–10s, one continuous intro shot or two quick establishing + host shots."
+}
