@@ -836,7 +836,7 @@ class H3StorySetup:
                 "mmproj_name": (_MMPROJ_FILES, {"default": "None"}),
                 "n_gpu_layers": ("INT", {"default": -1, "min": -1, "max": 200, "step": 1}),
                 "llm_base_url": ("STRING", {"default": "http://127.0.0.1:8080/v1/chat/completions"}),
-                "model": ("STRING", {"default": "Qwen3-VL-8B-Instruct-abliterated-v2.0.Q4_K_M"}),
+                "model": ("STRING", {"default": ""}),
                 "api_key": ("STRING", {"default": ""}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 999999, "step": 1}),
