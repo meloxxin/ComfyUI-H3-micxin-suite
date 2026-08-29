@@ -1,8 +1,8 @@
 {
-  "id": "h3-audiodrive-native",
+  "id": "h3-r2va-aio-micxin-example",
   "revision": 0,
-  "last_node_id": 26,
-  "last_link_id": 50,
+  "last_node_id": 23,
+  "last_link_id": 49,
   "nodes": [
     {
       "id": 13,
@@ -148,7 +148,7 @@
       "widgets_values": {
         "frame_rate": 24,
         "loop_count": 0,
-        "filename_prefix": "video/H3_keyframe",
+        "filename_prefix": "video/H3_keyframe_example",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 15,
@@ -265,15 +265,16 @@
         "minimax_h3_ref2va_int8_convrot.safetensors",
         "default",
         "comfy kitchen attention (sage)",
-        true,
-        "qwen3vl_4b.safetensors",
+        false,
+        "qwen3vl_32b.safetensors",
         "auto",
         "h3_qwen3vl_4b_tap24.safetensors",
         "cuda:0",
         "dynamic",
         "Minimax\\minimax_h3_video_vae_fp16.safetensors",
         "Minimax\\minimax_h3_audio_vae_fp32.safetensors",
-        "", "", "", "",
+        "", "", "",
+        "example_keyframe_coffee.jpg|example_audio_jazz.wav|0|0|0|0|0",
         24, 1024, 29, ""
       ]
     },
@@ -302,53 +303,18 @@
         {"name": "n_gpu_layers", "type": "INT", "widget": {"name": "n_gpu_layers"}, "link": null}
       ],
       "outputs": [
-        {"name": "prompt", "type": "STRING", "links": [46, 50]},
+        {"name": "prompt", "type": "STRING", "links": [46]},
         {"name": "width", "type": "INT", "links": [47]},
         {"name": "height", "type": "INT", "links": [48]},
         {"name": "length", "type": "INT", "links": [49]}
       ],
       "widgets_values": [
-        "Cinematic city night timelapse, neon lights reflecting on wet asphalt, light trails from passing cars, slow dolly-in through a downtown intersection, moody cyberpunk atmosphere, rain-soaked streets, steam rising from manholes, ultra-realistic, 8K, shallow depth of field",
+        "Cinematic close-up of a steaming cup of coffee on a wooden table, morning sunlight through window, steam rising slowly, warm cozy atmosphere, shallow depth of field, ultra-realistic, 8K",
         "H3 通用全参考模版（默认）",
         5, "9:16", "0.4", false, 8192,
-        "Local GGUF", "", "", false,
+        "Local GGUF", "minimax-h3-prompt-rewriter-8b-Q8_0.gguf", "mmproj-minimax-h3-prompt-rewriter-8b-f16.gguf", false,
         "http://127.0.0.1:8080/v1/chat/completions",
         "", "", 0.65, 698, "randomize", -1, false, false, ""
-      ]
-    },
-    {
-      "id": 26,
-      "type": "H3StorySetup",
-      "pos": [-2306.51, -491.69],
-      "size": [400, 660],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [
-        {"name": "concept", "type": "STRING", "widget": {"name": "concept"}, "link": null},
-        {"name": "style", "type": "COMBO", "widget": {"name": "style"}, "link": null},
-        {"name": "drama_genre", "type": "COMBO", "widget": {"name": "drama_genre"}, "link": null},
-        {"name": "num_shots", "type": "INT", "widget": {"name": "num_shots"}, "link": null},
-        {"name": "backend", "type": "COMBO", "widget": {"name": "backend"}, "link": null},
-        {"name": "gguf_name", "type": "COMBO", "widget": {"name": "gguf_name"}, "link": null},
-        {"name": "mmproj_name", "type": "COMBO", "widget": {"name": "mmproj_name"}, "link": null},
-        {"name": "llm_base_url", "type": "STRING", "widget": {"name": "llm_base_url"}, "link": null},
-        {"name": "model", "type": "STRING", "widget": {"name": "model"}, "link": null},
-        {"name": "api_key", "type": "STRING", "widget": {"name": "api_key"}, "link": null},
-        {"name": "temperature", "type": "FLOAT", "widget": {"name": "temperature"}, "link": null},
-        {"name": "seed", "type": "INT", "widget": {"name": "seed"}, "link": null}
-      ],
-      "outputs": [
-        {"name": "title", "type": "STRING", "links": null},
-        {"name": "screenplay", "type": "STRING", "links": null},
-        {"name": "h3_prompts", "type": "STRING", "links": null}
-      ],
-      "widgets_values": [
-        "城市夜景延时摄影，霓虹灯光，雨后湿润路面，车流光轨，电影感",
-        "电影感实拍", "纪录片", 6, true,
-        "Local GGUF", "", "", -1,
-        "http://127.0.0.1:8080/v1/chat/completions",
-        "", "", 0.7, 0, "randomize", false, false, ""
       ]
     }
   ],
@@ -374,14 +340,13 @@
     [46, 23, 0, 20, 0, "STRING"],
     [47, 23, 1, 20, 1, "INT"],
     [48, 23, 2, 20, 2, "INT"],
-    [49, 23, 3, 20, 3, "INT"],
-    [50, 23, 0, 24, 0, "STRING"]
+    [49, 23, 3, 20, 3, "INT"]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {"scale": 0.409, "offset": [3074.07, 991.67]},
-    "info": "H3 R2VA AIO 示例工作流：城市夜景延时摄影。H3PromptWriter 生成提示词 → H3ModelLoader 加载模型+Ref2VA编码 → SamplerCustomAdvanced 采样 → VAEDecode/VAEDecodeAudio 解码 → VHS_VideoCombine 合成视频。使用官方 int8 UNet + 4步加速 LoRA。",
+    "info": "H3 R2VA AIO 示例工作流：咖啡杯特写 + 关键帧音频驱动。H3PromptWriter（MiniMax 8B LLM）生成提示词 → H3ModelLoader（普通 CLIP 32B + 关键帧图+音频）加载模型 → SamplerCustomAdvanced 采样 → VAEDecode/VAEDecodeAudio 解码 → VHS_VideoCombine 合成视频。使用官方 int8 UNet + 4步加速 LoRA。关键帧示例文件请从 workflows/assets/ 复制到 ComfyUI/input/ 目录。",
     "frontendVersion": "1.49.6"
   },
   "version": 0.4

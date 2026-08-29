@@ -109,6 +109,41 @@ A: 提示词中每个有对白的镜头必须明确写 `lips opening and closing
 ### Q: 两个插件可以只装一个吗？
 A: 可以。AutoDirector 负责提示词写作，H3-helper 负责模型加载。但典型工作流需要两者配合使用。
 
+## 示例工作流
+
+`workflows/` 目录包含开箱即用的示例工作流：
+
+| 文件 | 说明 |
+|---|---|
+| `H3_R2VA_AIO_micxin_example.json` | H3 R2VA AIO 完整示例：咖啡杯特写 + 关键帧音频驱动。使用官方 int8 UNet + 4步加速 LoRA + MiniMax 8B LLM + 普通 CLIP 32B。 |
+| `assets/example_keyframe_coffee.jpg` | 示例关键帧图片（咖啡杯特写） |
+| `assets/example_audio_jazz.wav` | 示例音频驱动（爵士乐片段） |
+
+**使用方法**：将 `assets/` 下的示例文件复制到 `ComfyUI/input/` 目录，然后加载工作流即可直接运行。
+
+## 关于 MiniMax H3 Extender（非本套件节点）
+
+> **重要声明**：`MiniMaxH3Extender`、`MiniMaxH3MotionContextDiskFinalDecode`、`MiniMaxH3ReferencePackBridge`、`MiniMaxH3PromptPackBridge` 等节点**不属于本套件**，本仓库不包含这些节点的代码，也不提供其工作流文件。
+
+### 节点来源与依赖
+
+这些 Extender 系列节点基于 **[ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)** 生态开发，用于长视频分段链式生成。部分衍生版本（如 MultiRef fork）增加了参考图打包、提示词打包等桥接节点。
+
+如需使用 Extender 节点，请自行搜索并安装对应的自定义节点包（部分版本可能为付费或私有分发）。本套件不对 Extender 节点的功能、稳定性或兼容性负责。
+
+### "一键短剧"工作流的已知缺陷
+
+基于 Extender 的一键短剧工作流虽然方便，但存在以下结构性问题：
+
+1. **角色一致性难以保证**：多镜头分段生成时，角色外貌、发型、服装在不同镜头间容易漂移，尤其超过 3 个镜头后
+2. **场景连贯性差**：镜头切换时环境光照、物体位置、时间线容易断裂，Motion Context 只能缓解不能消除
+3. **音频口型不稳定**：长视频分段后，每段音频独立驱动，口型对齐在拼接处容易错位
+4. **显存占用极高**：Extender 使用磁盘缓存 + 最终解码，虽然降低了峰值显存，但生成速度慢，16GB 显存跑 5 段以上容易 OOM
+5. **工作流黑盒化**：节点参数多、内部逻辑复杂，出问题时难以定位和调试，新手基本无法调整
+6. **依赖链脆弱**：Extender 依赖 Motion Context、Bridge 节点、特定版本的 H3 模型，任何一个环节更新都可能导致整个工作流失效
+
+**建议**：对于短剧创作，优先使用本套件的 `H3PromptWriter` + `H3ModelLoader` 单镜头工作流，逐镜生成后手动剪辑拼接，可控性和稳定性远高于一键 Extender 方案。
+
 ## 许可证
 
 MIT License. 详见 [LICENSE](LICENSE)。
