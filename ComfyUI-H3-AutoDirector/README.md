@@ -45,8 +45,6 @@ ComfyUI-H3-AutoDirector/
 ├── __init__.py                  # 节点注册 + WEB_DIRECTORY="./js"
 ├── h3_screenwriter.py           # H3PromptWriter — 概念→H3提示词(调用 LLM)
 ├── h3_story_setup_node.py       # H3StorySetup — 一键短剧创作引擎
-├── h3_asset_library.py          # H3AssetLibrary — 资产管理
-├── h3_asset_library_api.py      # 资产库 API
 ├── h3_micxin_assets.py          # 并入的 micxin2025 资产：16 任务模板 + _tag_dialogue
 ├── h3_reference_builder.py      # 参考路径构建
 ├── h3_skill_manager.py          # 自定义 skill 管理
