@@ -51,21 +51,29 @@ if _ad is not None:
 _helper = _load_subpackage("ComfyUI-H3-helper", "h3_helper_pkg")
 if _helper is not None:
     try:
-        from h3_helper_pkg.h3_model_loader import H3ModelLoader
+        from h3_helper_pkg.h3_model_loader import H3ModelLoader, H3ModelOnlyLoader
         from h3_helper_pkg.h3_av_latent import H3SeparateAVLatent, H3CombineAVLatent
+        from h3_helper_pkg.h3_clip_chain_av import H3ClipChainAV
+        from h3_helper_pkg.h3_infinite_human import H3InfiniteHumanMV
 
         # Register V3 ComfyNode subclasses via V2 NODE_CLASS_MAPPINGS.
         # ComfyUI auto-detects io.ComfyNode subclasses and handles them
         # through the V3 execution path regardless of registration channel.
         NODE_CLASS_MAPPINGS["H3ModelLoader"] = H3ModelLoader
+        NODE_CLASS_MAPPINGS["H3ModelOnlyLoader"] = H3ModelOnlyLoader
         NODE_CLASS_MAPPINGS["H3SeparateAVLatent"] = H3SeparateAVLatent
         NODE_CLASS_MAPPINGS["H3CombineAVLatent"] = H3CombineAVLatent
+        NODE_CLASS_MAPPINGS["H3ClipChainAV"] = H3ClipChainAV
+        NODE_CLASS_MAPPINGS["H3InfiniteHumanMV"] = H3InfiniteHumanMV
 
         NODE_DISPLAY_NAME_MAPPINGS["H3ModelLoader"] = "H3 R2VA AIO (micxin)"
+        NODE_DISPLAY_NAME_MAPPINGS["H3ModelOnlyLoader"] = "H3 模型加载 (micxin)"
         NODE_DISPLAY_NAME_MAPPINGS["H3SeparateAVLatent"] = "H3 Separate AV Latent (micxin)"
         NODE_DISPLAY_NAME_MAPPINGS["H3CombineAVLatent"] = "H3 Combine AV Latent (micxin)"
+        NODE_DISPLAY_NAME_MAPPINGS["H3ClipChainAV"] = "H3 Clip Chain (micxin)"
+        NODE_DISPLAY_NAME_MAPPINGS["H3InfiniteHumanMV"] = "H3 InfiniteSampler (micxin)"
 
-        print(f"[H3-suite] OK registered helper V3 nodes via V2 channel: H3ModelLoader, H3SeparateAVLatent, H3CombineAVLatent", flush=True)
+        print(f"[H3-suite] OK registered helper V3 nodes via V2 channel: H3ModelLoader, H3SeparateAVLatent, H3CombineAVLatent, H3ClipChainAV, H3InfiniteHumanMV", flush=True)
     except Exception as e:
         print(f"[H3-suite] FAIL register helper nodes: {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()

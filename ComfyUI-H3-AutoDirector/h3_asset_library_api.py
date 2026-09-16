@@ -162,6 +162,51 @@ def delete_item(category: str, item_id: str) -> bool:
     save_library(library)
     return True
 
+def clear_library(delete_files: bool = False) -> dict:
+    """一键清除：清空资产库（角色/场景/道具）。
+
+    delete_files=True 时同时删除 ComfyUI 管辖范围内的图片文件（input/ 目录下）；
+    外部绝对路径（如 J:\\AIcharacters\\...）出于隐私安全边界**只从库中移除条目、
+    不删除文件**，避免误删用户其他项目素材。
+    返回统计：removed_items / deleted_files / skipped_external。
+    """
+    library = load_library()
+    removed_items = sum(len(library.get(c, [])) for c in ("characters", "scenes", "props"))
+    deleted_files = []
+    skipped_external = []
+
+    if delete_files:
+        try:
+            import folder_paths
+            input_dir = os.path.normpath(str(folder_paths.get_input_directory()))
+        except Exception:
+            input_dir = os.path.normpath("input")
+        seen = set()
+        for category in ("characters", "scenes", "props"):
+            for item in library.get(category, []):
+                img = (item.get("image") or "").strip()
+                if not img or img in seen:
+                    continue
+                seen.add(img)
+                resolved = _resolve_image_path(img) or img
+                norm = os.path.normpath(str(resolved))
+                try:
+                    if norm.startswith(input_dir + os.sep) and os.path.isfile(norm):
+                        os.remove(norm)
+                        deleted_files.append(norm)
+                    elif os.path.isfile(norm):
+                        # 非 input 目录：保留文件，仅记录（隐私安全边界）
+                        skipped_external.append(norm)
+                except OSError as e:
+                    skipped_external.append(f"{norm} (删除失败: {e})")
+
+    save_library({"characters": [], "scenes": [], "props": []})
+    return {
+        "removed_items": removed_items,
+        "deleted_files": deleted_files,
+        "skipped_external": skipped_external,
+    }
+
 
 # ---------------------------------------------------------------------------
 # 文件夹扫描
@@ -285,7 +330,7 @@ def _register_routes():
         print("[H3 AssetLibrary] 无法导入 server/PromptServer，路由注册跳过。", flush=True)
         return
 
-    if PromptServer.instance is None:
+    if getattr(PromptServer, "instance", None) is None:
         print("[H3 AssetLibrary] PromptServer.instance 为空，路由注册跳过。", flush=True)
         return
 
@@ -332,8 +377,16 @@ def _register_routes():
         category = body.get("category")
         if not folder:
             return web.json_response({"ok": False, "error": "缺少 folder 参数"}, status=400)
-        result = import_from_folder(folder, category)
-        return web.json_response({"ok": "error" not in result, "data": result})
+    @routes.post("/h3/asset_library/clear")
+    async def api_clear(request):
+        """一键清除：清空资产库，可选删除 input/ 目录下被引用的图片。"""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        delete_files = bool(body.get("delete_files", False))
+        result = clear_library(delete_files=delete_files)
+        return web.json_response({"ok": True, "data": result})
 
     # === 列表路由 ===
 

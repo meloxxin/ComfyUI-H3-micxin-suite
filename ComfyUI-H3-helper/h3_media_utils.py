@@ -25,7 +25,6 @@ MIN_CLIP_SEC = 2.0
 MAX_ITEMS = 3
 MAX_IMAGES = 9
 MAX_TOTAL_FILES = 12
-MAX_KEYFRAMES = 8
 DEFAULT_FRAME_RATE = 24
 DEFAULT_MAX_SIDE = 1024
 
@@ -66,6 +65,34 @@ def _resolve_path(path):
 
 
 def _parse_lines(text, max_items=MAX_ITEMS):
+    items = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        path = parts[0].strip()
+        if not path:
+            continue
+        start = end = 0.0
+        if len(parts) > 1:
+            try:
+                start = float(parts[1])
+            except ValueError:
+                start = 0.0
+        if len(parts) > 2:
+            try:
+                end = float(parts[2])
+            except ValueError:
+                end = 0.0
+        items.append((path, start, end))
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _parse_video_lines(text, max_items=MAX_ITEMS):
+    """解析参考视频行：path|start|end。"""
     items = []
     for raw in (text or "").splitlines():
         line = raw.strip()
@@ -373,7 +400,8 @@ def load_all_media(image_paths, video_paths, audio_paths, frame_rate, max_side):
         reports.append(f"[multi_output] 批合并 {len(real_imgs)} 张 -> {list(multi_output.shape)}")
 
     # ---- 视频 ----
-    vid_items = _parse_lines(video_paths)
+    # 行格式 path|start|end：所有视频都走 R2V 参考（运动/外观来源）。
+    vid_items = _parse_video_lines(video_paths)
     ref_videos = {}
     ref_video_audios = {}
     for i in range(min(len(vid_items), MAX_ITEMS)):
@@ -390,9 +418,9 @@ def load_all_media(image_paths, video_paths, audio_paths, frame_rate, max_side):
             reports.append(f"[视频 {i}] 裁剪时长 {end-start:.1f}s < {MIN_CLIP_SEC}s 最小建议")
         try:
             img, aud = _extract_video(full, start, end, frame_rate, max_side)
+            out_dur = img.shape[0] / max(1, frame_rate)
             ref_videos[f"ref_video_{i}"] = img
             ref_video_audios[f"ref_video_audio_{i}"] = aud
-            out_dur = img.shape[0] / max(1, frame_rate)
             parts = [f"[视频 {i}] {os.path.basename(path)} ({sz_mb:.1f}MB) -> 帧 {list(img.shape)}"]
             if end > start:
                 parts.append(f", 裁剪 {start:.1f}-{end:.1f}s 输出 {out_dur:.1f}s")
@@ -445,7 +473,8 @@ def load_all_media(image_paths, video_paths, audio_paths, frame_rate, max_side):
     if not reports:
         reports.append("（无素材已加载）")
 
-    return ref_images, ref_videos, ref_video_audios, ref_audios, multi_output, "\n".join(reports)
+    return ref_images, ref_videos, ref_video_audios, ref_audios, multi_output, \
+        "\n".join(reports)
 
 
 # ===========================================================================

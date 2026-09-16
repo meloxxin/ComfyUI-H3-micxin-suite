@@ -26,7 +26,22 @@ import { ensureAllTooltipsShown } from "./tooltip_hooker.js";
 import { ensureMigrationsApplied } from "./widget_value_migrator.js";
 
 const NODE_CLASS = "H3PromptWriter";
+const INFINITE_CLASS = "H3InfiniteStoryWriter";
+const SPLIT_TRANSLATE_CLASS = "H3PromptSplitTranslate";
+const NODE_CLASSES = [NODE_CLASS, INFINITE_CLASS, SPLIT_TRANSLATE_CLASS];
 const CONCEPT_WIDGET_NAME = "concept_text";  // INPUT_TYPES.required 第一位 (节点顶部 widgets[0], v7.2.1 起)
+
+function isTarget(node) {
+    return node && node.comfyClass && NODE_CLASSES.includes(node.comfyClass);
+}
+function isInfinite(node) {
+    return node && node.comfyClass === INFINITE_CLASS;
+}
+function getConceptWidgetName(node) {
+    if (isInfinite(node)) return "concept";
+    if (node.comfyClass === SPLIT_TRANSLATE_CLASS) return "raw_text";
+    return CONCEPT_WIDGET_NAME;
+}
 
 // v8: 高级 LLM 设置折叠组 —— advanced_settings 收起时这些 widget 全部 fold。
 // 顺序: llm_base_url / model / api_key / temperature / seed /
@@ -38,6 +53,26 @@ const ADVANCED_GROUP = [
     "n_gpu_layers", "keep_loaded",
     "bypass_llm",  // v8: prompt_override 已删，bypass 改用顶部 concept_text 粘贴提示词
 ];
+// H3InfiniteStoryWriter 的折叠组（concept 之后的 LLM 高级项）。
+const INFINITE_ADVANCED_GROUP = [
+    "context_size", "llm_base_url", "model", "api_key",
+    "temperature", "seed",
+    "n_gpu_layers", "keep_loaded", "bypass_llm",
+];
+function getAdvancedGroup(node) {
+    return isInfinite(node) ? INFINITE_ADVANCED_GROUP : ADVANCED_GROUP;
+}
+
+/* ---- SplitTranslate: raw_text / expected_segments 是纯 widget，不显示连线口 ----
+   V3 节点所有输入默认可连线；这两个是主输入/配置项，只应 widget 编辑。
+   LiteGraph input.noconnect=true 隐藏连线槽，widget 照常显示。 */
+const SPLIT_NO_CONNECT = new Set(["raw_text", "expected_segments"]);
+function applyNoConnectInputs(node) {
+    if (!node || node.comfyClass !== SPLIT_TRANSLATE_CLASS || !node.inputs) return;
+    for (const inp of node.inputs) {
+        if (inp && SPLIT_NO_CONNECT.has(inp.name)) inp.noconnect = true;
+    }
+}
 
 /* ---- input-types accessor (for schema-version migrations) ---- */
 function getInputTypes() {
@@ -140,7 +175,9 @@ function applyBackendVisibility(node) {
     if (adv && adv.value !== true) return;  // 高级组收起 → HTTP 三件已折叠, 不动
     const backend = getWidget(node, "backend");
     if (!backend) return;
-    const wantVisible = (backend.value === "HTTP endpoint");
+    const wantVisible = isInfinite(node)
+        ? (backend.value === "HTTP")
+        : (backend.value === "HTTP endpoint");
     const toggles = ["llm_base_url", "model", "api_key"];
     for (const nm of toggles) {
         const w = getWidget(node, nm);
@@ -160,7 +197,7 @@ function applyAdvancedVisibility(node) {
     if (!node || !node.widgets) return;
     const adv = getWidget(node, "advanced_settings");
     const expanded = !adv || adv.value === true;
-    for (const nm of ADVANCED_GROUP) {
+    for (const nm of getAdvancedGroup(node)) {
         const w = getWidget(node, nm);
         if (!w) continue;
         if (expanded) unfoldWidget(w);
@@ -176,7 +213,7 @@ function applyAdvancedVisibility(node) {
    第一位 = widgets[0])，强制 computeSize 返回大尺寸。textarea 上挂 @ 监听。
    这里不调任何 addDOMWidget —— LiteGraph 原生 widget 是 ComfyUI 最稳的元素。 */
 function enlargeConceptWidget(node) {
-    const w = getWidget(node, CONCEPT_WIDGET_NAME);
+    const w = getWidget(node, getConceptWidgetName(node));
     if (!w) return;
 
     // 1. 强制尺寸（160px, ~6-7 行文本可见，原 320px 缩小一半）。
@@ -211,7 +248,9 @@ function enlargeConceptWidget(node) {
                     "color:#fff","padding:5px 10px","font-size:12px","font-weight:600",
                     "border-radius:4px 4px 0 0","margin:0","letter-spacing:0.3px",
                 ].join(";");
-                header.innerHTML = "📝 提示词 (PROMPT) — 输入 @ 选择已上传的图/视/音素材";
+                header.innerHTML = isInfinite(node)
+                    ? "📝 故事概念 (CONCEPT) — 输入 @ 选素材，空行 = 分镜段"
+                    : "📝 提示词 (PROMPT) — 输入 @ 选择已上传的图/视/音素材";
                 wrap.parentNode.insertBefore(header, wrap);
                 wrap.style.borderRadius = "0 0 4px 4px";
                 wrap.__h3HeaderInjected = true;
@@ -458,16 +497,29 @@ function syncAIOImagePaths(node) {
 
 // 全局定时器：每 2 秒同步一次 AIO 图片路径（覆盖所有 Screenwriter 节点）
 let _aioSyncTimer = null;
+let _aioSyncEvt = false;
 function ensureAIOSyncTimer() {
     if (_aioSyncTimer) return;
     _aioSyncTimer = setInterval(() => {
         try {
             const nodes = (app.graph && app.graph.nodes) ? app.graph.nodes : [];
             for (const n of nodes) {
-                if (n && n.comfyClass === "H3Screenwriter") syncAIOImagePaths(n);
+                if (n && isTarget(n)) syncAIOImagePaths(n);
             }
         } catch (e) {}
     }, 2000);
+    // 事件驱动：AIO 素材变更时立即同步（不等 2 秒轮询）
+    if (!_aioSyncEvt) {
+        _aioSyncEvt = true;
+        try {
+            window.addEventListener("h3:aio-media-updated", () => {
+                const nodes = (app.graph && app.graph.nodes) ? app.graph.nodes : [];
+                for (const n of nodes) {
+                    if (n && isTarget(n)) syncAIOImagePaths(n);
+                }
+            });
+        } catch (e) {}
+    }
 }
 
 function openOrUpdateMenu(node, textarea, widget) {
@@ -539,6 +591,12 @@ const H3_OUTPUT_TOOLTIPS = [
     "length — 渲染帧数 (H3 length), = ceil(duration_seconds × 24) 对齐到 5 mod 17。"
     + "喂给 Ref2VA.length。H3 单段 ≤362 帧 (~15s)。",
 ];
+const INFINITE_OUTPUT_TOOLTIPS = [
+    "segments_json — 全部分镜段的六段式 JSON ({\"0\":..,\"1\":..})，接 H3PromptSplit 拆段，或贴回概念框。",
+    "width — 渲染画布宽度 (像素)，接 AIO(H3ModelLoader).width。",
+    "height — 渲染画布高度 (像素)，接 AIO.height。",
+    "length — 渲染总帧数 (各段对齐 %17==5 后求和)，接 AIO.length。",
+];
 let h3OutputTipInstalled = false;
 let h3OutputTipEl = null;
 
@@ -573,7 +631,7 @@ function ensureH3OutputTooltip() {
             const slot = canvasInst.getSlotInPosition
                 ? canvasInst.getSlotInPosition(lx, ly) : null;
             if (slot && slot.output !== undefined && slot.output !== null
-                && slot.node && slot.node.comfyClass === NODE_CLASS) {
+                && slot.node && isTarget(slot.node)) {
                 const tips = slot.node.__h3OutputTooltips;
                 if (tips && tips[slot.output]) {
                     h3OutputTipEl.textContent = tips[slot.output];
@@ -594,34 +652,75 @@ function ensureH3OutputTooltip() {
 
 /* ---- attachEditor (called from nodeCreated / onConfigure) ---- */
 function attachEditor(node) {
-    if (!node || !node.comfyClass || node.comfyClass !== NODE_CLASS) return;
+    if (!node || !node.comfyClass || !isTarget(node)) return;
 
     // 0. 概念 widget (widgets[0], 原生 STRING, multiline) — 强制大尺寸 + @ 监听
     enlargeConceptWidget(node);
 
-    // 0.5 隐藏 _aio_ref_paths（JS 自动从 AIO 同步，用户不可见）
-    //     widget DOM 可能异步构建，用轮询确保 element 出现后也隐藏
-    const aioPathsW = getWidget(node, "_aio_ref_paths");
-    if (aioPathsW) {
-        foldWidget(aioPathsW);
-        const hideAioEl = () => {
-            if (aioPathsW.element) aioPathsW.element.style.display = "none";
+    // 0.05 SplitTranslate: raw_text / expected_segments 隐藏连线口
+    applyNoConnectInputs(node);
+    setTimeout(() => applyNoConnectInputs(node), 100);
+    setTimeout(() => applyNoConnectInputs(node), 400);
+
+    // 0.5 隐藏 JS 内部 widget（_aio_ref_paths，自动读写，用户不可见；
+    //     image_paths/update 已按用户要求移除，不再有素材槽）。
+    for (const hnm of ["_aio_ref_paths"]) {
+        const hw = getWidget(node, hnm);
+        if (!hw) continue;
+        foldWidget(hw);
+        const hideEl = () => {
+            if (hw.element) hw.element.style.display = "none";
         };
-        hideAioEl();
+        hideEl();
         let hideTries = 0;
         const hideTimer = setInterval(() => {
             hideTries++;
-            hideAioEl();
+            hideEl();
             if (hideTries > 10) clearInterval(hideTimer);
         }, 100);
     }
+    // 0.6 seed 控件防护：禁用/移除 randomize（ComfyUI 对 INT 名为 seed 的
+    //     widget 自动加 randomize，保存工作流时把 'randomize' 字符串写进
+    //     widgets_values（seed 之后），把 n_gpu_layers 的位置顶掉 → GPU 层数
+    //     显示 0 → GGUF 纯 CPU → 不出结果。此处禁用控件 + 移除已生成的控件。）
+    try {
+        const seedW = getWidget(node, "seed");
+        if (seedW) {
+            if (seedW.options) seedW.options.control_after_generate = false;
+            for (let k = node.widgets.length - 1; k >= 0; k--) {
+                const cw = node.widgets[k];
+                if (cw && cw.name && /control[_ ]?after[_ ]?generate|randomize/i.test(String(cw.name))) {
+                    node.widgets.splice(k, 1);
+                }
+            }
+        }
+    } catch (e) {}
+
     // 立即同步一次 AIO 图片路径
     syncAIOImagePaths(node);
     ensureAIOSyncTimer();
 
     // 1. 友化中文 labels — LiteGraph 默认显示 widget.name (英文)，patch 让用户看得懂
-    //    v7.2: extra_instructions 已删；删对应 label
-    const labelPatch = {
+    const INFINITE_LABELS = {
+        concept:               "📝 故事概念 (concept, 空行=分镜段)",
+        segment_seconds:       "⏱ 每段秒数 (segment_seconds, 4~15s)",
+        aspect_ratio:          "📐 画幅 (aspect_ratio)",
+        resolution_mp:         "🖥 渲染分辨率 (MP 档 0.2~2.0)",
+        backend:               "⚙ 后端 (backend)",
+        gguf_name:             "📦 GGUF 模型 (Local GGUF 模式)",
+        mmproj_name:           "🖼 多模态投影 (Local GGUF 模式)",
+        advanced_settings:     "🧰 高级 LLM 设置 (默认折叠, 点击展开)",
+        context_size:          "🧠 上下文窗口 (context_size, 2048~65536)",
+        llm_base_url:          "🌐 LLM 接口 URL (HTTP 模式)",
+        model:                 "🤖 模型名 (HTTP 模式)",
+        api_key:               "🔑 API Key (高级组展开且 HTTP 模式才出现)",
+        temperature:           "🌡 温度 (temperature, 0.2-0.4 最稳)",
+        seed:                  "🎲 种子 (0=随机)",
+        n_gpu_layers:          "🧊 GPU 层数 (-1=全部)",
+        keep_loaded:           "🔁 写完不卸 (勾选=每次写都重载)",
+        bypass_llm:            "⏭ 绕过 LLM (把上一轮 segments_json 贴到 prompt_text)",
+    };
+    const labelPatch = isInfinite(node) ? INFINITE_LABELS : {
         task_mode:             "📋 任务模式 (task_mode)",
         duration_seconds:      "⏱ 渲染总秒数 (duration_seconds)",
         aspect_ratio:          "📐 画幅 (aspect_ratio)",
@@ -638,12 +737,40 @@ function attachEditor(node) {
         seed:                  "🎲 种子 (0=随机)",
         n_gpu_layers:          "🧊 GPU 层数 (-1=全部)",
         keep_loaded:           "🔁 写完不卸 (勾选=每次写都重载)",
-        bypass_llm:            "⏭ 绕过 VL 4B (用顶部概念框粘贴提示词)",
+        bypass_llm:            "⏭ 绕过 LLM (用顶部概念框粘贴提示词)",
     };
     for (const [key, lbl] of Object.entries(labelPatch)) {
         const w = getWidget(node, key);
         if (!w) continue;
         try { w.label = lbl; } catch (e) {}
+    }
+
+    // 4.0 SplitTranslate 专用 label
+    if (node.comfyClass === SPLIT_TRANSLATE_CLASS) {
+        const SL_LABELS = {
+            raw_text:            "📝 原始提示词 (raw_text, 输入 @ 选素材, 内部修复+拆分+翻译)",
+            expected_segments:   "🔢 期望段数 (expected_segments, 0=自动)",
+            aspect_ratio:        "📐 画幅 (aspect_ratio)",
+            resolution_mp:       "🖥 渲染分辨率 (MP 档 0.25~2.0)",
+            duration_seconds:    "⏱ 每段秒数 (duration_seconds)",
+            backend:             "⚙ 后端 (backend)",
+            gguf_name:           "📦 GGUF 模型 (Local GGUF 模式)",
+            mmproj_name:         "🖼 多模态投影 (Local GGUF 模式)",
+            context_size:        "🧠 上下文窗口 (context_size)",
+            n_gpu_layers:        "🧊 GPU 层数 (-1=全部)",
+            temperature:         "🌡 温度 (temperature)",
+            seed:                "🎲 种子 (0=随机)",
+            keep_loaded:         "🔁 模型常驻 (OFF=跑完即卸, 省显存)",
+            bypass_llm:          "⏭ 绕过 LLM (ON=不翻译, 重跑直接用原文)",
+            llm_base_url:        "🌐 LLM 接口 URL (HTTP 模式)",
+            model:               "🤖 模型名 (HTTP 模式)",
+            rewrite_mode:        "✍️ 提示词模式 (六段式反推=Writer同款模板 / 忠实翻译=旧行为)",
+        };
+        for (const [key, lbl] of Object.entries(SL_LABELS)) {
+            const w = getWidget(node, key);
+            if (!w) continue;
+            try { w.label = lbl; } catch (e) {}
+        }
     }
 
     // 2. Hook backend.combo — backend 切换时立刻折叠/展开 3 个 HTTP widget。
@@ -693,7 +820,7 @@ function attachEditor(node) {
 
     // 4. output tooltip
     try {
-        node.__h3OutputTooltips = H3_OUTPUT_TOOLTIPS;
+        node.__h3OutputTooltips = isInfinite(node) ? INFINITE_OUTPUT_TOOLTIPS : H3_OUTPUT_TOOLTIPS;
         ensureH3OutputTooltip();
     } catch (e) {}
 
@@ -701,7 +828,7 @@ function attachEditor(node) {
     try {
         const candidates = [];
         candidates.push("http://127.0.0.1:8080/v1/chat/completions");
-        candidates.push("Qwen3-VL-8B-Instruct-abliterated-v2.0.Q4_K_M");
+        candidates.push("minimax-h3-prompt-rewriter-8b-Q8_0.gguf");
         candidates.push("Local GGUF", "HTTP endpoint");
         const ggufW = node.widgets.find((w) => w.name === "gguf_name");
         if (ggufW && ggufW.options && Array.isArray(ggufW.options.values)) {
@@ -732,16 +859,18 @@ function attachEditor(node) {
 app.registerExtension({
     name: "ComfyUI-H3-AutoDirector.H3Screenwriter",
     async beforeRegisterNodeDef(nodeType, comfyClass) {
-        if (comfyClass !== NODE_CLASS) return;
+        if (!NODE_CLASSES.includes(comfyClass)) return;
         const _origOnConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function (info) {
             const r = _origOnConfigure ? _origOnConfigure.apply(this, arguments) : undefined;
             // 磁盘 reload 后立刻按 advanced_settings + backend 折叠
             try { if (this.widgets) applyAdvancedVisibility(this); } catch (e) {}
-            // schema migration (默认值同步)
+            // schema migration (默认值同步, 仅 H3PromptWriter)
             try {
-                const its = getInputTypes();
-                if (its && info) ensureMigrationsApplied(this, its, info.widgets_values);
+                if (!isInfinite(this)) {
+                    const its = getInputTypes();
+                    if (its && info) ensureMigrationsApplied(this, its, info.widgets_values);
+                }
             } catch (e) {}
             return r;
         };
@@ -749,14 +878,16 @@ app.registerExtension({
     nodeCreated(node) {
         attachEditor(node);
         try {
-            node.__h3OutputTooltips = H3_OUTPUT_TOOLTIPS;
+            node.__h3OutputTooltips = isInfinite(node) ? INFINITE_OUTPUT_TOOLTIPS : H3_OUTPUT_TOOLTIPS;
             ensureH3OutputTooltip();
         } catch (e) {}
         ensureAllTooltipsShown(node);
-        // schema migration
+        // schema migration (仅 H3PromptWriter)
         try {
-            const its = getInputTypes();
-            if (its) ensureMigrationsApplied(node, its);
+            if (!isInfinite(node)) {
+                const its = getInputTypes();
+                if (its) ensureMigrationsApplied(node, its);
+            }
         } catch (e) {}
     },
 });

@@ -85,6 +85,32 @@ import { api } from "/scripts/api.js";
         return data.data;
     }
 
+    async function clearLibrary() {
+        const delFiles = confirm(
+            "将清空整个资产库（角色/场景/道具），此操作不可撤销！\n\n" +
+            "是否同时删除 input/ 目录下被库引用的图片文件？\n" +
+            "【确定】= 连图一起删（隐私彻底清除）\n" +            "【取消】= 只清空库数据，保留图片文件\n\n" +
+            "注：外部路径图片（非 input/ 目录）只移除条目不删文件。"
+        );
+        if (!confirm("再次确认：清空资产库？")) return;
+        try {
+            setStatus("正在清除...", "");
+            const data = await apiFetch("/h3/asset_library/clear", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ delete_files: !!delFiles }),
+            });
+            if (!data.ok) throw new Error(data.error || "清除失败");
+            const d = data.data || {};
+            const delN = (d.deleted_files || []).length;
+            const extN = (d.skipped_external || []).length;
+            setStatus(`已清除 ${d.removed_items ?? 0} 条资产；删除图片 ${delN} 个；外部文件 ${extN} 个仅移除条目未删文件`, "ok");
+            await refreshAll();
+        } catch (e) {
+            setStatus(`一键清除失败: ${e.message}`, "error");
+        }
+    }
+
     async function describeImage(image) {
         const data = await apiFetch("/h3/asset_library/describe", {
             method: "POST",
@@ -351,6 +377,7 @@ import { api } from "/scripts/api.js";
                     <div class="h3-list-toolbar">
                         <button class="h3-btn primary" id="h3-add-btn">➕ 添加</button>
                         <button class="h3-btn" id="h3-batch-desc-btn" title="用 LLM 为当前 Tab 下所有有图但无描述的资产自动生成英文描述">⚡ 批量打标</button>
+                        <button class="h3-btn danger" id="h3-clear-btn" title="清空整个资产库（可连同删除 input/ 目录下被库引用的图片，外部路径图片仅移除条目不删文件）">🗑️ 一键清除</button>
                     </div>
                     <div class="h3-list" id="h3-list"></div>
                 </div>
@@ -370,6 +397,7 @@ import { api } from "/scripts/api.js";
 
         // 事件绑定
         panelEl.querySelector(".h3-panel-close").onclick = hidePanel;
+        panelEl.querySelector("#h3-clear-btn").onclick = clearLibrary;
         panelEl.querySelectorAll(".h3-tab").forEach(tab => {
             tab.onclick = () => switchTab(tab.dataset.tab);
         });

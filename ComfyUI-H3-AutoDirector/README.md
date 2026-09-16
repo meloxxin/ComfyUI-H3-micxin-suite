@@ -7,7 +7,7 @@ MiniMax H3 全自动剧本创作与提示词生成节点集（by micxin2025，�
 | 节点 | 说明 |
 |---|---|
 | **H3 Prompt Writer (micxin)** | 概念 → H3 官方六段式提示词。支持 16 种任务模式、剧本模式、资产库联动、Local GGUF / HTTP endpoint 双后端 |
-| **H3 Story Setup (micxin)** | 一键短剧创作引擎。一句话创意 → 剧本 + 分镜表 + 图片提示词 + H3六段式视频提示词 |
+| **H3 Story Setup (micxin)** | 一键短剧创作引擎。一句话创意 → 剧本 + 分镜表 + 图片提示词 + H3 六段式视频提示词 |
 | **H3 Asset Library (micxin)** | 角色/场景/道具资产管理面板（前端 UI） |
 | **H3 Skill Manager (micxin)** | 自定义 skill 模板安装/删除 |
 | **H3 Reference Builder (micxin)** | 参考图/视频/音频路径构建 |

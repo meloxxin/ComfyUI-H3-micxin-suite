@@ -203,8 +203,18 @@ _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
 def _strip_think(text):
-    return re.sub(r"<think>[\s\S]*?</think>|<thinking>[\s\S]*?<\/thinking>",
-                  "", text, flags=re.IGNORECASE).strip()
+    if not text:
+        return text
+    # 成对思考块（含 <|think|> / <thinking> / <|thinking|> 变体）
+    out = re.sub(
+        r"<(?:/)?(?:think|thinking|\|think\||\|thinking\|)[^>]*>[\s\S]*?"
+        r"<(?:/)?(?:think|thinking|\|think\||\|thinking\|)[^>]*>",
+        "", text, flags=re.IGNORECASE)
+    # 剥残留的未闭合思考标签（如模型输出被 max_tokens 截断）
+    out = re.sub(r"<(?:/)?(?:think|thinking|\|think\||\|thinking\|)[^>]*>",
+                 "", out, flags=re.IGNORECASE)
+    # 思考块剥离后常留下大片空行（Split 按空行拆段会被误拆）
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
 def _clean_text(text):
@@ -400,6 +410,157 @@ def _default_mmproj():
     return ""
 
 
+
+
+
+
+# 方言注入（writer 输出后处理）：粤语自动/标记/强制 → <d>[Cantonese] 台词</d>
+
+
+def _detect_dialogue_language(text):
+    """检测对话语言，返回 H3 标准语言标记（Chinese/English/Japanese/Korean）。"""
+    import re as _re
+    if _re.search(r'[\u4e00-\u9fff]', text):
+        return 'Chinese'
+    if _re.search(r'[\u3040-\u30ff]', text):
+        return 'Japanese'
+    if _re.search(r'[\uac00-\ud7af]', text):
+        return 'Korean'
+    return 'English'
+
+
+_TEMPLATE_LEAK_MARKS = ("<persistent", "<action + camera", "<ambience>",
+                        "Cinematic live-action. <")
+
+
+def _translation_failed(original, translated, n_dlg):
+    """翻译模式输出异常判定：模板泄漏 / 没翻译 / 空行块数与输入不一致。
+
+    n_dlg>0 时输出含中文对话是正常的，跳过中文占比检查。
+    """
+    if not translated or not translated.strip():
+        return True
+    low = translated.lower()
+    if any(m in low for m in _TEMPLATE_LEAK_MARKS):
+        return True
+    if n_dlg == 0:
+        cjk = sum(1 for ch in translated if "\u4e00" <= ch <= "\u9fff")
+        if cjk / max(1, len(translated)) > 0.25:
+            return True
+    try:
+        in_blocks = _split_concept_segments(original)
+        out_blocks = _split_concept_segments(translated)
+        if in_blocks and len(in_blocks) != len(out_blocks):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# v10.4: 行内对话标记——兼容"场景描述 + 她说：「台词」"同行格式
+# （_tag_dialogue 要求整行为"说话者：台词"，混排行会被漏掉，台词以裸引号
+#   进入 user_brief，弱模型易翻译/丢弃/编造。这里把行内台词预打 <d> 标签。）
+_INLINE_DLG_RE = None
+
+
+def _tag_inline_dialogue_lines(text):
+    """把行内 说话者：「台词」 片段标记为 <d>[语言] 台词</d>。
+
+    返回 (标记后文本, 台词原文列表)。不要求整行纯对话。
+    例：'镜头一：女主锁门。她说：「下雨了，真冷。」'
+        -> '镜头一：女主锁门。她说：<d>[Chinese] 下雨了，真冷。</d>'
+    """
+    import re as _re
+    global _INLINE_DLG_RE
+    if _INLINE_DLG_RE is None:
+        _INLINE_DLG_RE = _re.compile(
+            r'([^：:""\n]{1,15}?)\s*[：:]\s*["“「]([^”"」\n]{1,200}?)["”」]')
+    if not text:
+        return text, []
+    contents = []
+
+    def _repl(m):
+        sp = m.group(1).strip()
+        content = m.group(2).strip()
+        if not content:
+            return m.group(0)
+        lang = _detect_dialogue_language(content)
+        contents.append(content)
+        return '%s：<d>[%s] %s</d>' % (sp, lang, content)
+
+    out = _INLINE_DLG_RE.sub(_repl, text)
+    return out, contents
+
+
+def _protect_dialogue(text):
+    """把引号内对话与 <d> 标签台词替换为 {{DLG_N}} 占位符（代码级对话保护）。
+
+    LLM 翻译/转换时不会翻译占位符；输出后 _restore_dialogue 还原原文。
+    覆盖 <d>[语言] ... </d> 整块（用户概念里已写好的 H3 格式台词——
+    原样保护，LLM 不可能改语言标记/加前缀/重写），以及「」『』“” 与英文双引号。
+    返回 (保护后文本, 对话列表)。
+    """
+    dlg = []
+    def _repl(m):
+        dlg.append(m.group(0))
+        return "{{DLG_%d}}" % (len(dlg) - 1)
+    # 1) <d> 标签整块（保留原语言标记与原文，还原时原样写回）
+    out = re.sub(r'<d>(?:\[[^\]]*\])?\s*.*?</d>', _repl, text, flags=re.S)
+    # 2) 引号内对话
+    out = re.sub(r'[「『“”"].+?[」』”"“]', _repl, out, flags=re.S)
+    return out, dlg
+
+
+def _restore_dialogue(text, dlg):
+    """把 {{DLG_N}} 占位符还原为 H3 标准 <d>[语言] 对话内容</d> 格式。
+
+    <d> 标签块原样还原（语言标记/原文/标点一个不动）；引号对话去掉引号、
+    检测语言后按 H3 标准 <d> 包裹。兼容模型输出中占位符已被 <d>...</d>
+    包裹的情况：整块替换，避免 <d> 嵌套。还原后再做一轮嵌套清洗与
+    残留占位符兜底，保证输出永远是干净的单层 <d>。
+    """
+    import re as _re
+    for i, d in enumerate(dlg):
+        ph = "{{DLG_%d}}" % i
+        _tag = _re.match(r'^<d>(\[[^\]]*\])?\s*(.*?)</d>$', d, flags=_re.S)
+        if _tag:
+            # 原 <d> 块：整块原样还原（保留用户写的语言标记，如 [国语]）
+            formatted = d
+        else:
+            content = _re.sub(r'^[「『\u201c\"\u201d]+|[」』\u201d\"\u201c]+$', '', d)
+            lang = _detect_dialogue_language(content)
+            formatted = '<d>[%s] %s</d>' % (lang, content)
+        # 1) 占位符已被 <d> ... </d> 包裹：整块替换为正确标签
+        pat = r'<d>(?:\[[^\]]*\])?\s*' + _re.escape(ph) + r'\s*</d>'
+        text = _re.sub(pat, lambda m: formatted, text)
+        # 2) 裸占位符（模型没有包 <d>）
+        text = text.replace(ph, formatted)
+    # 3) 嵌套清洗：LLM 可能把概念里的 <d> 块复制出来又套一层 <d>[X]，
+    #    产生 <d>[Chinese] <d>[国语] ...</d></d> —— 剥掉外层，保留内层干净块。
+    for _ in range(4):
+        _new = _re.sub(
+            r'<d>(?:\[[^\]]*\])?\s*(<d>(?:\[[^\]]*\])?\s*.*?</d>)\s*</d>',
+            lambda m: m.group(1), text, flags=_re.S)
+        if _new == text:
+            break
+        text = _new
+    return text
+
+
+def _split_concept_segments(text):
+    """把用户分镜按段拆开（与 H3PromptSplit 同款逻辑）：
+    - 空行=段分隔，连续非空行合并为一段
+    - 无空行时每行一段
+    - // 开头行=注释跳过；# 开头行保留
+    拆镜由代码完成，不依赖 LLM。
+    """
+    lines = [l for l in text.splitlines() if not l.strip().startswith("//")]
+    if any(not l.strip() for l in lines):
+        blocks = [b.strip() for b in re.split(r"\n\s*\n", "\n".join(lines)) if b.strip()]
+        return [re.sub(r"\s*\n\s*", " ", b) for b in blocks]
+    return [l.strip() for l in lines if l.strip()]
+
+
 def _load_local_llm(gguf_name, mmproj_name, n_gpu_layers, n_ctx):
     import llama_cpp  # noqa: F401  (ensures llama-cpp-python is present)
     from llama_cpp import Llama
@@ -439,7 +600,7 @@ def _load_local_llm(gguf_name, mmproj_name, n_gpu_layers, n_ctx):
               "n_ctx": int(n_ctx), "verbose": False}
     if chat_handler is not None:
         kwargs["chat_handler"] = chat_handler
-    # 2026-08-22: 自动降级重试。16G 显卡与 Krea2 共存时，全量 offload + 大上下文
+    # 2026-08-22: 自动降级重试。16G 显存吃紧时，全量 offload + 大上下文
     # 会触发 "Failed to create context with model"。依次尝试：
     #   1) 原始参数
     #   2) n_ctx 减半
@@ -493,21 +654,43 @@ def _call_local_llm(llm, messages, temperature, seed, max_tokens=_MAX_GEN_TOKENS
            "max_tokens": max_tokens, "stream": False}
     if seed:
         gen["seed"] = int(seed)
-    try:
-        out = llm.create_chat_completion(**gen)
-    except RuntimeError as e:
-        msg = str(e)
-        if "Context Shift" in msg or "n_ctx" in msg or "context" in msg.lower():
-            raise _ContextOverflow(msg) from e
-        raise
-    choices = out.get("choices") or [{}]
-    content = (choices[0].get("message", {}) or {}).get("content") or ""
-    if not content.strip():
-        content = (choices[0].get("message", {}) or {}).get(
-            "reasoning_content", "") or ""
-    if not content.strip():
-        raise ValueError("Local LLM returned empty content.")
-    return content
+    # Qwen3 系模型默认输出思考过程，会污染翻译结构（思考里带换行 → Split 误拆段）。
+    # 与 HTTP 路径一致：chat_template_kwargs={"enable_thinking": False} 关闭思考。
+    # 旧版 llama-cpp-python 不支持该参数 → TypeError 回退不带参数重试。
+    # 魔改/角色扮演微调模板可能忽略 enable_thinking（全程思考 → content 空）。
+    # 因此做三级模板重试：no-thinking → default → thinking，三种都空才抛错。
+    attempts = [
+        ("no-thinking", {"chat_template_kwargs": {"enable_thinking": False}}),
+        ("default", {}),
+        ("thinking", {"chat_template_kwargs": {"enable_thinking": True}}),
+    ]
+    for label, extra in attempts:
+        try:
+            out = llm.create_chat_completion(**gen, **extra)
+        except TypeError:
+            out = llm.create_chat_completion(**gen)
+        except RuntimeError as e:
+            msg = str(e)
+            if "Context Shift" in msg or "n_ctx" in msg or "context" in msg.lower():
+                raise _ContextOverflow(msg) from e
+            raise
+        choices = out.get("choices") or [{}]
+        content = (choices[0].get("message", {}) or {}).get("content") or ""
+        if not content.strip():
+            content = (choices[0].get("message", {}) or {}).get(
+                "reasoning_content", "") or ""
+        if content.strip():
+            if label != "no-thinking":
+                print(f"[H3 AutoDirector] local LLM '{label}' 模式重试后拿到内容。",
+                      flush=True)
+            return content
+        print(f"[H3 AutoDirector] local LLM '{label}' 模式返回空内容，重试下一模式…",
+              flush=True)
+    raise ValueError(
+        "Local LLM returned empty content.（no-thinking / default / thinking "
+        "三种模板模式均空回复）建议：① 换 HTTP 后端（llama.cpp server / one-api）；"
+        "② 检查该 GGUF 的 chat template 是否为 Qwen3 标准模板；"
+        "③ 缩短概念或调小 context_size，避免 n_ctx 降级后 prompt 被截断。")
 
 
 def _unload_local():
@@ -542,35 +725,139 @@ def _unload_local():
 # like the style appendices; if true, it replaces the entire system prompt.
 SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
+
+
+def _parse_md_skill(md_path):
+    """WorkBuddy SKILL.md / SKILL.cn.md -> skill dict（供任务模式使用）。
+
+    frontmatter 取 name / display_name（可选）/ description；正文（去 frontmatter）
+    作为 system_prompt。正文过长会撑爆本地 LLM context：截取前 6000 字符
+    （约 3K token），保证 8K ctx 的 Qwen GGUF 可用。standalone=False 表示按
+    追加模式挂到 REVERSE_INFERENCE_BASE 之后（保留 JSON 数组输出契约）。
+    """
+    try:
+        with open(md_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except Exception as e:
+        print(f"[H3 AutoDirector] failed to read skill {md_path}: {e}", flush=True)
+        return None
+    m = _FRONTMATTER_RE.match(raw)
+    fm = {}
+    body = raw
+    if m:
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                fm[k.strip()] = v.strip().strip("|").strip()
+        body = raw[m.end():].strip()
+    name = fm.get("name") or os.path.splitext(os.path.basename(md_path))[0]
+    display_name = fm.get("display_name") or name
+    return {
+        "display_name": display_name,
+        "system_prompt": body[:6000],
+        "standalone": False,
+        "style_contract": "Cinematic live-action",
+        "path": md_path,
+    }
+
 
 def _load_custom_skills():
-    """Load custom skill templates from skills/ directory."""
+    """Load custom skill templates from skills/ directory.
+    支持两种格式：
+    1. skills/<key>.json —— 节点原生格式（key/display_name/system_prompt/
+       standalone/style_contract）。
+    2. skills/<name>/SKILL.md 或 SKILL.cn.md —— WorkBuddy 格式（frontmatter +
+       正文，从 J:/skill 技能库注入）。没有 md 的空目录安全跳过。
+    """
     skills = {}
     if not os.path.isdir(SKILLS_DIR):
         return skills
+    # 与内置 16 风格主题重复的 WorkBuddy 技能：任务模式只保留内置中文版，
+    # 避免下拉出现 8 对同主题重复项（文件保留，想用时可从集合移除恢复）。
+    _MD_SKILL_IGNORE = {
+        "3d-animation-short-generator", "brand-promo-video-generator",
+        "co-op-game-intro-generator", "handdrawn-live-video-generator",
+        "minimalist-product-ad-generator", "mv-subtitle-skill-confirmed",
+        "paper-collage-explainer-generator", "papercraft-stop-motion-explainer",
+    }
     for fn in sorted(os.listdir(SKILLS_DIR)):
-        if not fn.lower().endswith(".json"):
+        if fn in _MD_SKILL_IGNORE:
             continue
         path = os.path.join(SKILLS_DIR, fn)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            key = data.get("key") or os.path.splitext(fn)[0]
-            display_name = data.get("display_name") or key
-            skills[key] = {
-                "display_name": display_name,
-                "system_prompt": data.get("system_prompt", ""),
-                "standalone": bool(data.get("standalone", True)),
-                "style_contract": data.get("style_contract", "Cinematic live-action"),
-                "path": path,
-            }
-        except Exception as e:
-            print(f"[H3 AutoDirector] failed to load skill {fn}: {e}", flush=True)
+        if os.path.isfile(path) and fn.lower().endswith(".json"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                key = data.get("key") or os.path.splitext(fn)[0]
+                display_name = data.get("display_name") or key
+                skills[key] = {
+                    "display_name": display_name,
+                    "system_prompt": data.get("system_prompt", ""),
+                    "standalone": bool(data.get("standalone", True)),
+                    "style_contract": data.get("style_contract", "Cinematic live-action"),
+                    "path": path,
+                }
+            except Exception as e:
+                print(f"[H3 AutoDirector] failed to load skill {fn}: {e}", flush=True)
+        elif os.path.isdir(path):
+            for mdfn in ("SKILL.md", "SKILL.cn.md"):
+                mdp = os.path.join(path, mdfn)
+                if os.path.isfile(mdp):
+                    info = _parse_md_skill(mdp)
+                    if info:
+                        # key 用目录名（唯一），display_name 是下拉显示名
+                        skills[fn] = info
+                    break
     return skills
 
 
 CUSTOM_SKILLS = _load_custom_skills()
 CUSTOM_SKILL_KEYS = list(CUSTOM_SKILLS.keys())
+
+# ---------------------------------------------------------------------------
+# 写作增强规则（训练语料归纳，2026-09-13 注入 fullreference 反推模板）
+# 来源：MiniMax H3 Singularity Prompt Writing Specification (Enhanced)。
+# 只追加到 fullreference（H3PromptWriter 默认模式 + SplitTranslate 反推共用），
+# 其余 task_mode 模板不动，避免改变已验收行为。
+# ---------------------------------------------------------------------------
+H3_WRITING_ENHANCEMENTS = r"""# WRITING QUALITY RULES (corpus-derived, apply to EVERY shot you write)
+ACTION CHAIN: never write isolated action labels ("walks", "attacks", "turns",
+"explodes"). Expand every primary action into a causal chain: preparation ->
+trigger -> acceleration -> primary action -> contact -> reaction -> recovery ->
+final state. State the initial state BEFORE the trigger and the resulting state
+AFTER the action.
+CAMERA SPEC: name one camera idea per shot with all five elements: camera
+position / shot size + movement type + direction + speed/amplitude + subject
+followed. Bind the camera to the action (e.g. a side-tracking camera matches the
+character's running speed; a push-in accelerates toward the instant of impact).
+Never write "dynamic camera" / "cinematic camera" without these specifics.
+MICRO-ACTING: convert abstract emotions into observable behavior - gaze
+direction, blinking, eyebrow movement, lip tension, breathing, posture, hand
+tension, and explicit attention (what the character looks at / reacts to).
+Instead of "she looks nervous", describe her gaze shifting toward the doorway,
+lips tightening, breathing becoming shallow, fingers adjusting their grip.
+REFERENCE ROLE SPLIT: a reference image is NOT automatically a video first
+frame. In subject_definitions, lock each character's appearance from the
+reference with an explicit sentence such as: "The reference image <Picture N>
+defines her facial features, hair style, and body proportions." (adapt N to
+the actual tag). Use <Picture N> as an independent reference ONLY when it
+genuinely anchors the shot as first frame / keyframe / composition anchor.
+Never renumber, invent, or drop reference tags.
+CROSS-SHOT CONTINUITY: keep screen direction consistent; carry weapon position,
+body pose, object ownership, damage, dirt, smoke, and broken props forward
+between shots; keep speaker IDs (S1)/(S2) stable; synchronize footsteps /
+impacts / cloth movement with visible events.
+AUDIO LAYERING: overall_soundscape carries ambient + synchronized diegetic
+effects (dialogue, footsteps, impacts); non_diegetic_music carries ONLY the
+audience-only score - never mix the score into the physical soundscape.
+DISTANT SUBJECTS: when characters are far in the frame, explicitly state they
+keep walking / moving throughout the shot at a steady pace - small on-screen
+scale must NOT freeze them.
+FORBIDDEN FILLER: "cinematic", "epic", "high quality", "dynamic" must never
+replace observable visual instructions - every visual claim must be something
+the camera can actually show."""
+
 
 
 def _build_system_prompt(task_key):
@@ -579,7 +866,7 @@ def _build_system_prompt(task_key):
         info = CUSTOM_SKILLS[task_key]
         sp = info["system_prompt"]
         if not sp:
-            sp = MX._build_system_prompt("fullreference")
+            sp = _build_system_prompt("fullreference")
         elif not info.get("standalone", True):
             # Append-style: base + skill + dialogue preservation rule
             sp = (MX.REVERSE_INFERENCE_BASE + "\n\n" + sp
@@ -588,7 +875,46 @@ def _build_system_prompt(task_key):
             # Standalone: skill + dialogue preservation rule
             sp = sp + "\n\n" + MX.DIALOGUE_PRESERVE_RULE
         return sp
-    return MX._build_system_prompt(task_key)
+    sp = MX._build_system_prompt(task_key)
+    if task_key == "fullreference":
+        sp = sp + "\n\n" + H3_WRITING_ENHANCEMENTS
+    return sp
+
+
+_DIALECT_TAG_RE = re.compile(r"<d>\[([^\]]+)\](.*?)</d>", re.S)
+_DIALECT_PLAIN_RE = re.compile(r"<d>(?![\[])([^<]*[\u4e00-\u9fff][^<]*)</d>", re.S)
+
+
+def _fix_dialect_tags(text, src_text):
+    """确定性兜底：原文台词附近（±60 字符）有『粤语/广东话/Cantonese』
+    字样 → 把该台词的语言标签强制改为 [Cantonese]，不依赖 LLM 自觉。
+    同时处理 <d>[Lang] 台词</d>（改标签）与 <d>台词</d>（补标签）。"""
+    if not src_text or "<d>" not in text:
+        return text
+    def _has_canto(content):
+        core = re.sub(r"[，。！？、；：\s“”()（）!?;:.]", "", content)
+        if len(core) < 2:
+            return False
+        needle = re.escape(core[:6])
+        for hit in re.finditer(needle, src_text):
+            ctx = src_text[max(0, hit.start() - 60): hit.end() + 60]
+            if re.search(r"粤语|广东话|Cantonese|cantonese", ctx):
+                return True
+        return False
+    def repl_tag(m):
+        tag, content = m.group(1), m.group(2)
+        if tag.upper() == "CANTONESE":
+            return m.group(0)
+        if _has_canto(content):
+            return f"<d>[Cantonese]{content}</d>"
+        return m.group(0)
+    text = _DIALECT_TAG_RE.sub(repl_tag, text)
+    def repl_plain(m):
+        content = m.group(1)
+        if _has_canto(content):
+            return f"<d>[Cantonese]{content}</d>"
+        return m.group(0)
+    return _DIALECT_PLAIN_RE.sub(repl_plain, text)
 
 
 def _resolve_task_key(task_mode):
@@ -608,7 +934,9 @@ def _refresh_custom_skills():
     CUSTOM_SKILLS.update(_load_custom_skills())
     CUSTOM_SKILL_KEYS[:] = list(CUSTOM_SKILLS.keys())
     # Rebuild TASK_MODE_OPTIONS in-place so future node placements see new skills.
-    TASK_MODE_OPTIONS[:] = [dn for dn, _ in MX.STYLE_OPTIONS]
+    TASK_MODE_OPTIONS[:] = [
+        dn for dn, _ in MX.STYLE_OPTIONS if dn not in _TASK_MODE_EXCLUDE
+    ]
     TASK_MODE_OPTIONS.extend(CUSTOM_SKILLS[k]["display_name"] for k in CUSTOM_SKILL_KEYS)
 
 
@@ -781,20 +1109,26 @@ _DEFAULT_STYLE = "电影感实拍"
 # widget.value，导致节点读到的是列表 ["H3 通用全参考模版（默认）","fullreference"]
 # 而非字符串，无法解析。改成纯字符串列表后 combo 只存字符串，_resolve_style_key
 # 仍把显示名映射到内部键。
-TASK_MODE_OPTIONS = [dn for dn, _ in MX.STYLE_OPTIONS] + [
+# 任务模式下拉排除「H3 通用全参考模版（默认）」（用户不用通用模版；
+# fullreference 内部键保留，H3PromptSplitTranslate 反推仍共用）。
+_TASK_MODE_EXCLUDE = {"H3 通用全参考模版（默认）"}
+TASK_MODE_OPTIONS = [
+    dn for dn, _ in MX.STYLE_OPTIONS if dn not in _TASK_MODE_EXCLUDE
+] + [
     CUSTOM_SKILLS[k]["display_name"] for k in CUSTOM_SKILL_KEYS
 ]
-_DEFAULT_TASK_MODE = TASK_MODE_OPTIONS[0] if TASK_MODE_OPTIONS else ""
+_DEFAULT_TASK_MODE = (
+    "H3 提示词写作（micxin 增强）"
+    if "H3 提示词写作（micxin 增强）" in TASK_MODE_OPTIONS
+    else (TASK_MODE_OPTIONS[0] if TASK_MODE_OPTIONS else ""))
 _DEFAULT_NUM_SHOTS = 1
 _DEFAULT_DURATION = 10
 _DEFAULT_ASPECT = "16:9"
 _DEFAULT_MP = "0.4"
 
-# 上下文窗口（用户可调）。默认 8192：16G 显卡 + Krea2 共存时 32K KV cache(~4G)
-# 会导致 "Failed to create context with model"。screenwriter 输出上限 4096 token，
-# 输入+系统提示约 1-2K，单图反推 1024 token/图，8192 足够日常使用。
-# 多图反推或长概念时可调大到 16384/32768（显存充足时）。
-_DEFAULT_CONTEXT_SIZE = 8192
+# 上下文窗口（用户可调）。默认 32768：16G 显存最大化——9B Q4 模型 32K 上下文
+# 用 KV cache 量化（Q8_0）可容纳，长剧本/多参考图反推不再截断。
+_DEFAULT_CONTEXT_SIZE = 32768
 _N_CTX = _DEFAULT_CONTEXT_SIZE  # 兼容旧代码引用
 
 
@@ -822,7 +1156,7 @@ SCRIPT_MODE_SYSTEM_PROMPT = r"""You are a professional short-drama screenwriter 
       "scene": "scene1",
       "characters": ["S1"],
       "duration": 5,
-      "prompt": "Cinematic live-action. <persistent scene + character appearance, restated verbatim>. [Shot 1] <action + camera>. <physical sound>. <Speaker (S1) says: <d>[Language] verbatim line</d> if any>. overall_soundscape: <ambience>. non_diegetic_music: <score or N/A>."
+      "prompt": "Write the ACTUAL H3 prompt in English with the user's concrete content (scene, action, camera, sound, dialogue) — NEVER copy or echo this template or any <...> placeholder. Layout to follow: Cinematic live-action. [restate the shot's scene + character appearance verbatim]. [Shot N] [concrete action + camera move]. overall_soundscape: [concrete ambience]. non_diegetic_music: [concrete score or N/A]."
     }
   ]
 }
@@ -830,16 +1164,102 @@ SCRIPT_MODE_SYSTEM_PROMPT = r"""You are a professional short-drama screenwriter 
 # HARD RULES
 1. NARRATIVE in ENGLISH inside each shot's "prompt". Dialogue / lyrics keep original language inside <d>[Language] ... </d>.
 2. EACH SHOT IS SELF-CONTAINED: restate the persistent scene location, the character's exact appearance, and the visual style VERBATIM in every shot's prompt. Do NOT "refer back" to shot 1.
-3. SHOT BUDGET: total duration across all shots must equal the user's requested TOTAL DURATION. Each shot 2-6 seconds. Max 6 shots for a 15s clip.
+3. SHOT BUDGET: If the user's concept EXPLICITLY marks shots — numbered markers like "镜头一/镜头二" or "Shot 1/Shot 2", explicit transitions like 【切场】/【转场】, or blank-line separated blocks — you MUST output EXACTLY as many shots as the user marked, preserving their order and boundaries. NEVER merge marked shots, never drop one, never add extra shots. Only when the concept has NO shot markers at all (a single narrative paragraph), infer the count from narrative complexity: one continuous scene/action = EXACTLY 1 shot; split only on explicit scene changes, time jumps, or distinctly different action phases. The max shot count is an upper bound, NOT a target — do not pad a simple concept with extra shots. Total duration across all shots must equal the user's requested TOTAL DURATION. Each shot 2-6 seconds; honor per-shot durations if the user tagged them (e.g. "5秒").
 4. CHARACTERS: every character gets a stable id (S1, S2, ...) and appears in the "characters" list. A shot's "characters" array lists only who is on-screen.
 5. SCENES: every location gets a stable id (scene1, scene2, ...). A shot's "scene" field is exactly one scene id.
-6. DIALOGUE: if the concept contains dialogue, tag it with the speaker id inside the shot prompt: `<Subject N> (Sx) says: <d>[Language] verbatim line</d>`. Use code-level tagging rules: Cantonese detection for 嘅哋咗佢嘢乜唔咁啲㗎喇喎啩咩冇噶.
+6. DIALOGUE: Never invent, fabricate, or add dialogue, singing lyrics, or spoken lines that the user did not explicitly write. If the concept already contains an H3 dialogue block like `<d>[语言] 原句</d>`, copy that WHOLE block VERBATIM (the <d> tags, the language marker, and the text) into the corresponding shot's "prompt" — do NOT add a speaker prefix (no "says:", no "S1 says:"), do NOT change or re-detect the language marker, do NOT rewrite, translate, or re-quote the line. Only when the concept has no <d> block but has exact spoken lines (in quotes or after explicit markers such as 说/唱/对话/交谈), preserve those VERBATIM in the original language as `<d>[Language] 原句</d>` inside the shot prompt. A shot without user-provided lines MUST have NO dialogue and NO speaker block at all — carry its audio only through overall_soundscape / non_diegetic_music (or the reference audio). Never echo example characters, detection lists, or any non-line text as dialogue.
 7. CAMERA: one clear camera move per shot (type + amplitude + speed).
 8. The "prompt" field for each shot is the COMPLETE H3 prompt for that shot alone — it must render correctly if fed to H3 by itself.
-9. Output ONLY the JSON object. First character must be "{" and last must be "}". No code fences, no explanation, no thinking out loud.
+9. FORBIDDEN to output the template itself: never emit literal angle-bracket placeholders such as <action + camera> or <ambience>, and never copy instruction sentences or template labels (like 'concrete physical sound' or 'restate') into the output. Every shot "prompt" must be the user's actual content expanded into concrete English. A prompt that only restates the template is a FAILURE — rewrite it.
+10. Output ONLY the JSON object. First character must be "{" and last must be "}". No code fences, no explanation, no thinking out loud.
 
 # REFERENCE MATERIALS
 If the user's concept contains <Picture N> / <Video N> / <Audio N> tags, weave them into the relevant shots' prompts. Restate the same tag in EVERY shot that uses that asset. NEVER invent a reference tag the concept did not include."""
+
+
+SHOT_SPLIT_SYSTEM_PROMPT = r"""You are a professional short-drama screenwriter and H3 prompt engineer. The user gives you a SHOT LIST (分镜). Your ONLY job is to convert each user shot into a structured JSON screenplay — the shot count, order and boundaries are FIXED by the user and must never change.
+
+# OUTPUT FORMAT (strict — output ONLY this JSON, no markdown fences, no prose)
+{
+  "characters": [
+    {"id": "S1", "name": "角色名", "description": "英文外貌描述，1-2句"}
+  ],
+  "scenes": [
+    {"id": "scene1", "name": "场景名", "description": "英文环境描述，1-2句"}
+  ],
+  "shots": [
+    {
+      "shot": 1,
+      "scene": "scene1",
+      "characters": ["S1"],
+      "duration": 5,
+      "prompt": "Write the ACTUAL H3 prompt in English with the user's concrete content (scene, action, camera, sound, dialogue) — NEVER copy or echo this template or any <...> placeholder. Layout to follow: Cinematic live-action. [restate the shot's scene + character appearance verbatim]. [Shot N] [concrete action + camera move]. overall_soundscape: [concrete ambience]. non_diegetic_music: [concrete score or N/A]."
+    }
+  ]
+}
+
+# HARD RULES
+1. NARRATIVE in ENGLISH inside each shot's "prompt". Dialogue / lyrics keep the original language inside <d>[Language] ... </d>.
+2. SHOT COUNT IS FIXED: count the user's shots (镜头N / Shot N markers, 【切场】 transitions, blank-line separated blocks, or numbered items). Output EXACTLY the same number of shots in the SAME order. FORBIDDEN: merging two user shots into one, splitting one user shot into multiple, dropping a user shot, adding new shots, or reordering.
+3. EACH SHOT IS SELF-CONTAINED: restate the persistent scene location, the character's exact appearance, and the visual style VERBATIM in every shot's prompt. Do NOT "refer back" to shot 1.
+4. CHARACTERS: every character gets a stable id (S1, S2, ...). A shot's "characters" array lists only who is on-screen.
+5. SCENES: every location gets a stable id (scene1, scene2, ...). A shot's "scene" field is exactly one scene id.
+6. DIALOGUE: Every shot with people interacting MUST include dialogue. If the user's shot provides exact lines, preserve them VERBATIM in the original language: `<Subject N> (Sx) says: <d>[Language] 原句</d>`. If the shot mentions talking / conversation / 说 / 聊 / 对话 / 交谈 without exact lines, WRITE a short in-character Chinese line (one short sentence, 4-15 字) for the scene and tag it the same way. NEVER omit dialogue from a conversation scene; only pure action shots may have none.
+7. CAMERA: one clear camera move per shot (type + amplitude + speed).
+8. DURATION: the sum of all shot durations MUST equal the user's TOTAL DURATION. Honor per-shot durations if the user tagged them (e.g. "5秒"); otherwise divide the total evenly. Each shot 2-6 seconds.
+9. FORBIDDEN to output the template itself: never emit literal angle-bracket placeholders such as <action + camera> or <ambience>, and never copy instruction sentences or template labels (like 'concrete physical sound' or 'restate') into the output. Every shot "prompt" must be the user's actual content expanded into concrete English. A prompt that only restates the template is a FAILURE — rewrite it.
+10. Output ONLY the JSON object. First character must be "{" and last must be "}". No code fences, no explanation.
+
+# REFERENCE MATERIALS
+If the user's concept contains <Picture N> / <Video N> / <Audio N> tags, weave them into the relevant shots' prompts. Restate the same tag in EVERY shot that uses that asset. NEVER invent a reference tag the concept did not include."""
+
+SHOT_CONVERT_SYSTEM_PROMPT = r"""You are a professional prompt engineer for the MiniMax H3 video generation model.
+
+TASK: The user will input ONE shot description (may be Chinese). Convert it into ONE six-section structured prompt.
+
+SIX-SECTION STRUCTURE (titles in English, in this exact order):
+【1. Subject & Features】
+【2. Action & Behavior】
+【3. Scene & Environment】
+【4. Camera & Composition】
+【5. Lighting & Color】
+【6. Style & Quality】
+
+CORE RULES (violating any rule is an error):
+1. Except dialogue, ALL descriptive content (subject appearance, action, scene, camera, lighting, style) MUST be and ONLY be in English.
+2. DIALOGUE RULE (highest priority): if the user input contains any dialogue, lines, or speech content (including Mandarin, Cantonese, dialect, mixed Chinese-English, Hong Kong Mandarin, etc.), you MUST copy these dialogue contents VERBATIM and UNCHANGED into 【2. Action & Behavior】. Absolutely FORBIDDEN to translate, transcribe, rewrite, or omit. Whatever language and characters the dialogue is in, write exactly that — not one punctuation mark changed.
+3. In 【2. Action & Behavior】, describe the speaking action and accent in English (e.g. speaking with a Cantonese accent), then place the verbatim dialogue in English quotation marks. Format example: speaking with a Cantonese accent: "你食咗饭未啊？"
+4. If the user input contains <Picture N> / <Video N> / <Audio N> tags, restate the exact same tag VERBATIM in the relevant section. NEVER invent a tag the input did not include.
+5. Strictly process ONLY the current input. Absolutely FORBIDDEN to quote, imitate, reference, or output any examples, historical dialogue, or dialogue from training data. Write exactly what the user wrote.
+6. Do not output any explanation, greeting, or extra text. Output ONLY the six-section prompt.
+Your role is a format converter: translate descriptive parts into English, treat dialogue as an unchangeable constant string embedded verbatim."""
+
+TRANSLATE_SYSTEM_PROMPT = r"""You are a FORMAT CONVERTER (NOT a translator) for video shot prompts (分镜).
+
+OUTPUT CONTRACT (highest priority, violating any of these is a severe error):
+- Output the converted shot list ONLY. Nothing else.
+- FORBIDDEN: thinking, reasoning, analysis, explanation, summary, preface, commentary, notes, or any text outside the converted shots.
+- Do NOT use <think>, <thinking>, or any reasoning tags. Do NOT start with "Here is", "Sure", "好的", "以下是" or any preamble. Do NOT end with closing remarks.
+- The converted shot text is your ENTIRE response, from the first character to the last.
+
+SEGMENT RULE (this structure is how downstream splits shots):
+- The user input is a shot list: each shot is one block, and blocks are separated by BLANK LINES.
+- Count the input blocks. Output EXACTLY the same number of blocks, separated by BLANK LINES, in the same order.
+- One input block = one output block. NEVER merge two blocks, NEVER split one block into several, NEVER add, drop, or reorder blocks.
+- Preserve each block's internal line breaks and shot markers (镜头一 / Shot 1 / 【切场】) exactly as in the input.
+- If the input has NO blank-line-separated blocks (it is a single paragraph with no shot markers), output it as ONE single block — do not invent splits.
+
+TASK:
+- Translate ONLY descriptive text (subject, action, scene, camera, lighting, style) into English.
+- Everything else stays exactly as in the input.
+
+CORE RULES (violating any rule is an error):
+1. PLACEHOLDER RULE (highest priority): dialogue inside quotation marks has already been replaced by {{DLG_N}} placeholders (N is a number). {{DLG_N}} is an UNCHANGEABLE CONSTANT STRING — copy it VERBATIM and UNCHANGED into the output, in exactly the same position. Absolutely FORBIDDEN to translate, transcribe, rewrite, omit, move, or expand any {{DLG_N}}. If you see {{DLG_0}}, output exactly {{DLG_0}}. (After LLM output, the system will automatically convert each {{DLG_N}} into H3 standard format <d>[language] dialogue text</d> — the LLM does NOT need to write <d> tags itself.)
+2. NO INVENTIONS: restate ONLY the tags and markers that already exist in the input. If the input has no <Picture N> / <Video N> / <Audio N> tag, do NOT invent one. If the input has no "Shot N" numbering, do NOT add any numbering. If the input has no 【切场】, do NOT add it.
+3. TEMPLATE LEAK FORBIDDEN: the output must contain ONLY the converted shot text. Never output lines like "VISUAL STYLE:", "ASPECT RATIO:", "NOTE:", "TASK:", or any instruction text — those are template lines, not content.
+4. Strictly process ONLY the current input. FORBIDDEN to quote examples, historical dialogue, or training data.
+
+Your role is a format converter: descriptive parts become English, {{DLG_N}} dialogue placeholders are unchangeable constant strings, blank-line blocks are preserved one-to-one."""
 
 
 def _extract_script_json(text):
@@ -912,8 +1332,10 @@ def _validate_and_normalize_script(data, total_duration):
         duration = int(sh.get("duration", max(2, total_duration // len(shots))))
         duration = max(2, min(15, duration))
         prompt = sh.get("prompt", "").strip()
+        # v10.6: 不再静默丢弃空 prompt 镜头（否则如"第三镜丢失"会无声发生），
+        # 保留由上层兜底注入台词/告警。
         if not prompt:
-            continue
+            prompt = ""
         normalized.append({
             "shot": int(shot_num),
             "scene": str(scene_id),
@@ -1099,6 +1521,116 @@ def _extract_asset_image_paths(char_map, scene_map, prop_map):
     return "\n".join(paths)
 
 
+# ────────────────────────────────────────────────────────────
+# LLM 输出缓存（v10.8）：同一概念 + 同一组参数下 LLM 只反推一次。
+# 之后命中缓存直接复用上次反推的最终分镜 —— 既省 LLM 加载+推理时间，
+# 又保证提示词字节级不变（下游 ClipChain 的段缓存可稳定命中）。
+# 缓存自动失效：改概念/参数/参考图/资产库 → key 变 → 自动重新反推并覆盖。
+# 无需手动清理：文件超上限自动 LRU 删最旧；损坏/版本不符自动当没缓存。
+# ────────────────────────────────────────────────────────────
+_LLM_CACHE_VERSION = 2
+_LLM_CACHE_MAX_FILES = 24
+
+
+def _llm_cache_dir():
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_cache")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _refs_mtime(refs):
+    """参考图路径行 → (path, mtime, size) 列表；图片内容变了自动失效。"""
+    out = []
+    for line in (refs or "").splitlines():
+        line = (line or "").strip()
+        if not line:
+            continue
+        p = line.split("|")[0].strip()
+        if not p:
+            continue
+        if not os.path.isabs(p):
+            try:
+                cand = os.path.join(folder_paths.get_input_directory(), p)
+                if os.path.exists(cand):
+                    p = cand
+            except Exception:
+                pass
+        try:
+            st = os.stat(p)
+            out.append((p, st.st_mtime, st.st_size))
+        except OSError:
+            pass
+    return out
+
+
+def _make_llm_cache_key(concept_text, task_key, script_mode, aspect_ratio,
+                        resolution_mp, dur, backend, gguf_name, mmproj_name,
+                        context_size, model, llm_base_url, csp, refs, assets):
+    import hashlib
+    payload = {
+        "v": _LLM_CACHE_VERSION,
+        "concept": (concept_text or "").strip(),
+        "task_key": task_key,
+        "script_mode": bool(script_mode),
+        "aspect": str(aspect_ratio), "mp": str(resolution_mp), "dur": int(dur),
+        "backend": backend, "gguf": gguf_name, "mmproj": mmproj_name,
+        "ctx": int(context_size), "model": model, "url": llm_base_url,
+        "csp": (csp or "").strip(), "assets": (assets or "").strip(),
+        "refs": _refs_mtime(refs),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _llm_cache_load(key, force):
+    if force:
+        return None
+    p = os.path.join(_llm_cache_dir(), "writer_llm_%s.json" % key)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("key") != key or d.get("version") != _LLM_CACHE_VERSION:
+            return None
+        return d.get("result")
+    except Exception:
+        return None
+
+
+def _llm_cache_save(key, result):
+    try:
+        d = {
+            "key": key, "version": _LLM_CACHE_VERSION,
+            "created": time.time(),
+            "result": result,
+        }
+        p = os.path.join(_llm_cache_dir(), "writer_llm_%s.json" % key)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, p)
+        # LRU 清理：超过上限删最旧，无需用户手动清理
+        files = []
+        for fn in os.listdir(_llm_cache_dir()):
+            if fn.startswith("writer_llm_") and fn.endswith(".json"):
+                fp = os.path.join(_llm_cache_dir(), fn)
+                try:
+                    files.append((os.path.getmtime(fp), fp))
+                except OSError:
+                    pass
+        if len(files) > _LLM_CACHE_MAX_FILES:
+            for _m, _f in sorted(files)[:len(files) - _LLM_CACHE_MAX_FILES]:
+                try:
+                    os.remove(_f)
+                except OSError:
+                    pass
+    except Exception as e:
+        print(f"[H3 AutoDirector] LLM 缓存保存失败: {e}", flush=True)
+
+
 class H3PromptWriter:
     """Concept -> H3 multi-shot prompt (auto prompt writer).
 
@@ -1163,8 +1695,8 @@ class H3PromptWriter:
                     "tooltip": "[最关键的输入] 正常模式 = 提示词；绕过模式 = 上一轮提示词。"
                                "输入 @ 弹出下拉菜单，仅列出已在 H3 R2VA AIO(micxin) 上传的 "
                                "Picture / Video / Audio 素材标签（动态，不上传不出现）。"
-                               "开启 bypass_llm 后，把上一轮的 h3_script 或 prompts_json "
-                               "直接粘贴到这里复用，不再调用 LLM。"}),
+                               "开启 bypass_llm 后：把上一轮提示词粘贴到顶部概念框，"
+                               "跳过 LLM 直接输出。"}),
                 # === 1) 节点 widget 区顶部：4 个 setup widget（v8 删 style / num_shots）===
                 # v8 起 style 硬编码 Cinematic live-action、num_shots 硬编码 1，
                 # 不再暴露 widget。视觉风格由概念描述 + LLM 推断，单镜最稳。
@@ -1182,20 +1714,9 @@ class H3PromptWriter:
                     "default": _DEFAULT_MP,
                     "tooltip": "渲染分辨率档位（百万像素）。0.2-0.5MP 稳、1.0MP 出片、1.5-2.0MP 达 2K。"
                                "渲染分辨率 = √(MP × 比例), 全部对齐到 32 倍数。"}),
-                # === 1.5) 剧本模式开关（v10 新增 — 为短剧打造）===
-                # 开启后 LLM 输出结构化 JSON（角色档案+场景档案+分镜列表），
-                # 节点解析后输出每镜独立的 prompt + 时长 + 角色/场景ID。
-                # 关闭时保持旧行为：输出单一 prompt 字符串。
-                "script_mode": ("BOOLEAN", {
-                    "default": False,
-                    "label_on": "剧本模式（结构化分镜输出）",
-                    "label_off": "普通模式（单段提示词）",
-                    "tooltip": "【为短剧打造】开启后 LLM 输出结构化分镜 JSON，节点解析后输出："
-                               "shots(每镜prompt列表) / shot_durations(每镜帧数) / "
-                               "shot_characters(每镜角色ID) / shot_scenes(每镜场景ID) / "
-                               "characters_json(角色档案) / scenes_json(场景档案)。"
-                               "下游可逐镜渲染、批量生成、单镜重跑。"
-                               "关闭时保持旧行为：仅输出单一 prompt 字符串。"}),
+                # === 1.5) 剧本模式（script_mode）已于 v10.10 删除 ===
+                # 分镜/多段 JSON 输出改用 H3 无限时长编剧 (H3InfiniteStoryWriter)——
+                # 多段六段式 JSON，比旧剧本模式更稳。
             },
             "optional": {
                 # === 2) 上下文调节（替换原运镜短语/时机）===
@@ -1253,7 +1774,7 @@ class H3PromptWriter:
                                           "tooltip": "生成温度。0.65 偏高，创意更发散；"
                                                      "若 JSON 契约不稳（乱码/丢字段）再降到 0.3-0.4。"
                                                      "默认 0.65（2026-08-19 调高）。"}),
-                "seed": ("INT", {"default": 0, "min": 0,
+                "seed": ("INT", {"default": 0, "min": 0, "control_after_generate": False,
                                  "tooltip": "0 = let the endpoint decide."}),
                 "n_gpu_layers": ("INT", {"default": -1, "min": -1, "max": 200, "step": 1,
                                          "tooltip": "Local GGUF only. 把模型多少层卸载到 GPU。"
@@ -1301,21 +1822,6 @@ class H3PromptWriter:
                                "注意：自定义 system prompt 会负责最终输出格式，"
                                "但节点仍会把 concept / 风格 / 时长 / 分辨率 / 运镜"
                                "作为 user message 追加。"}),
-                # === 9) 资产库输入（v10.1 新增 — 资产联动）===
-                # 接受外部资产库 JSON（角色/场景/道具的图片路径+描述），
-                # 剧本模式下自动引用资产，把资产图同步给 AIO。
-                # 格式A: {"characters":[{"id":"S1","name":"女主","image":"path.png"}], "scenes":[...], "props":[...]}
-                # 格式B: {"S1":{"name":"女主","image":"path.png"}, "scene1":{...}}
-                "asset_library": ("STRING", {
-                    "default": "",
-                    "forceInput": True,
-                    "tooltip": "【资产联动】外接资产库 JSON（剧本模式下生效）。"
-                               "包含角色/场景/道具的图片路径和描述。"
-                               "连接后：①LLM生成提示词时自动引用资产ID；"
-                               "②资产图片路径自动同步给 H3 R2VA AIO（无需连线）；"
-                               "③输出的 characters_json/scenes_json 包含图片路径，"
-                               "可直接驱动资产生成工作流。"
-                               "格式: {\"characters\":[{\"id\":\"S1\",\"name\":\"女主\",\"description\":\"...\",\"image\":\"path.png\"}], \"scenes\":[...], \"props\":[...]}"}),
             },
         }
 
@@ -1323,17 +1829,10 @@ class H3PromptWriter:
     # 普通模式(script_mode=False)：shots/durations/characters/scenes 返回空列表，
     #   characters_json/scenes_json 返回空字符串 — 旧工作流不受影响。
     # 剧本模式(script_mode=True)：返回每镜独立数据，下游可逐镜渲染/批量生成。
-    RETURN_TYPES = ("STRING", "INT", "INT", "INT",
-                    "STRING", "INT", "STRING", "STRING", "STRING", "STRING")
+    RETURN_TYPES = ("STRING", "INT", "INT", "INT")
     RETURN_NAMES = (
-        "prompt (H3 官方 skill 提示词)",
+        "prompt",
         "width", "height", "length",
-        "shots (每镜prompt列表)",
-        "shot_durations (每镜帧数)",
-        "shot_characters (每镜角色ID)",
-        "shot_scenes (每镜场景ID)",
-        "characters_json (角色档案)",
-        "scenes_json (场景档案)",
     )
     FUNCTION = "write"
     CATEGORY = "H3 helper/micxin/AutoDirector"
@@ -1358,6 +1857,9 @@ class H3PromptWriter:
         （video = zeros[..., height//16, width//16]），所以 1.0~2.0 档真实生效
         （即 H3 标称的 "up to 2K"）。只是 >1.03MP 超出训练舒适区，偏软偏慢。
         """
+        # 1.0MP 16:9 特判为官方推荐表值 1376x768（不按公式 1344x736）
+        if aspect_ratio == "16:9" and abs(float(resolution_mp) - 1.0) < 1e-9:
+            return 1376, 768
         a = self.ASPECT_FACTORS.get(aspect_ratio, 16 / 9)
         mp_px = float(resolution_mp) * 1_000_000.0
         w = math.sqrt(mp_px * a)
@@ -1381,7 +1883,8 @@ class H3PromptWriter:
               # 1) 4 个 setup widget（v8 删 style / num_shots）
               task_mode=_DEFAULT_TASK_MODE, duration_seconds=_DEFAULT_DURATION,
               aspect_ratio=_DEFAULT_ASPECT, resolution_mp=_DEFAULT_MP,
-              # 1.5) 剧本模式开关（v10 新增 — 为短剧打造）
+              # 1.5) 剧本模式（script_mode）已删除（v10.10）：分镜/多段 JSON 输出
+              # 改用 H3 无限时长编剧 (H3InfiniteStoryWriter)。这里恒为 False。
               script_mode=False,
               # 2) 上下文调节（替换原运镜短语/时机）
               context_size=_DEFAULT_CONTEXT_SIZE,
@@ -1398,14 +1901,16 @@ class H3PromptWriter:
               n_gpu_layers=-1, keep_loaded=False, bypass_llm=False,
               _aio_ref_paths="",
               custom_system_prompt="",
-              # 9) 资产库（v10.1 新增 — 资产联动）
-              asset_library=""):
+              ):
         # ---- 概念源：仅从顶部 concept_text 原生 STRING widget 拿 ----
         # v7.2 改用 LiteGraph 原生 STRING widget（不再用 addDOMWidget）。
+        # prompt_text 兜底初始化：任何路径下都保证有值，避免 UnboundLocalError。
+        prompt_text = ""
 
-        # v10.1: 提前解析资产库（bypass 模式和正常模式都要用）
-        char_map, scene_map, prop_map = _parse_asset_library(asset_library)
-        has_assets = bool(char_map or scene_map or prop_map)
+        # v10.1: 资产库输入口已删除（用户否决 A→Writer/A→AIO 自动联动），
+        # 资产图改由 AIO 手动填 + JS 同步给 LLM 看图。这里恒为空。
+        char_map, scene_map, prop_map = {}, {}, {}
+        has_assets = False
 
         # task_mode 兜底（v7.2.2 修）：旧工作流曾把 combo 二元组整个存成列表
         # ["H3 通用全参考模版（默认）","fullreference"]，导致节点收不到字符串。
@@ -1439,11 +1944,52 @@ class H3PromptWriter:
                 pass
             print(f"[H3 AutoDirector] bypass_llm ON: reused prompt "
                   f"({len(prompt_text)} chars); LLM skipped.", flush=True)
+            # bypass 模式不调用 LLM：无 {{DLG_N}} 占位符需要还原/校验，
+            # 提前初始化避免下方 `if dlg_list:` 触发 UnboundLocalError。
+            dlg_list = []
             # bypass 模式下如果开启了剧本模式，尝试解析用户粘贴的 JSON 剧本
             if script_mode:
                 data, _err = _extract_script_json(ov)
                 if data is not None:
                     characters, scenes, shots_list = _validate_and_normalize_script(data, dur)
+            # v10.3: 还原 {{DLG_N}} -> <d>[语言] 原文</d>（代码级对话保留）
+            if dlg_list:
+                for _s in shots_list:
+                    _s["prompt"] = _restore_dialogue(_s["prompt"], dlg_list)
+            # v10.3b: 对话硬校验——用户台词原文必须出现在输出里，缺失则修正重试一次
+            if dlg_list:
+                import re as _re2
+                _dlg_contents = [_re2.sub(r'^[「『\u201c\"\u201d]+|[」』\u201d\"\u201c]+$', '', d)
+                                 for d in dlg_list]
+                _joined = "".join(_s.get("prompt", "") for _s in shots_list)
+                _missing = [c for c in _dlg_contents if c and c not in _joined]
+                if _missing:
+                    print(f"[H3 AutoDirector] 剧本模式检测到台词丢失 {_missing}，修正重试一次...",
+                          flush=True)
+                    _retry_msgs = messages + [
+                        {"role": "assistant", "content": prompt_text},
+                        {"role": "user", "content": (
+                            "CORRECTION: you dropped the script's exact dialogue lines. "
+                            "You MUST include each of these lines VERBATIM inside "
+                            "<d>[Language] ... </d> in the matching shot's prompt: "
+                            + json.dumps(_dlg_contents, ensure_ascii=False)
+                            + ". Never translate or paraphrase them. Regenerate the "
+                            "full JSON screenplay now.")}
+                    ]
+                    _retry_text = self._generate(_retry_msgs, temperature, seed, backend,
+                                                 gguf_name, mmproj_name, n_gpu_layers,
+                                                 context_size, keep_loaded,
+                                                 llm_base_url, model, api_key) or ""
+                    _retry_data, _retry_err = _extract_script_json(_retry_text)
+                    if not _retry_err:
+                        _rc, _rs, _rshots = _validate_and_normalize_script(_retry_data, dur)
+                        if _rshots:
+                            characters, scenes, shots_list = _rc, _rs, _rshots
+                            print(f"[H3 AutoDirector] 修正重试成功: {len(shots_list)} 镜，台词已恢复。",
+                                  flush=True)
+                    else:
+                        print(f"[H3 AutoDirector] 修正重试仍失败: {_retry_err} (保留第一次输出)",
+                              flush=True)
                     # v10.1: 合并资产库信息
                     if has_assets:
                         characters, scenes = _merge_assets_into_output(
@@ -1456,14 +2002,50 @@ class H3PromptWriter:
                     characters_json = json.dumps(characters, ensure_ascii=False)
                     scenes_json = json.dumps(scenes, ensure_ascii=False)
                     total_length = sum(shot_frames)
-                    print(f"[H3 AutoDirector] bypass+剧本模式: {len(shots_list)} 镜."
-                          + (f" 资产联动: {len(char_map)}角色/{len(scene_map)}场景." if has_assets else ""),
-                          flush=True)
-                    return (joined_prompt, width, height, total_length,
-                            shots_prompts, shot_frames, shot_characters, shot_scenes,
-                            characters_json, scenes_json)
-            return (prompt_text, width, height, length,
-                    [], [], [], [], "", "")
+                    print(f"[H3 AutoDirector] bypass+剧本模式: {len(shots_list)} 镜.", flush=True)
+                    return (json.dumps(shots_prompts, ensure_ascii=False), width, height, total_length)
+                # 手打模式：concept_text 不是 JSON 剧本，则按行拆分为多镜。
+                # bypass_llm + 剧本模式 下 Writer 变身手打分镜输入器，等价于 H3PromptSplit：
+                # 每行 = 一个 clip，回车换行 = 下一段（# // 开头行跳过）。
+                # 先试 JSON 数组文本（["镜一","镜二"]）→ 元素=段
+                _json_parsed = None
+                if ov.strip().startswith("["):
+                    try:
+                        _json_parsed = json.loads(ov)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        _json_parsed = None
+                if isinstance(_json_parsed, list):
+                    _lines = [str(x).strip() for x in _json_parsed
+                              if str(x).strip() and not str(x).strip().startswith("//")]
+                else:
+                    _split_text = ov
+                    _ov_lines = [l for l in _split_text.split("\n")
+                                 if not l.strip().startswith("//")]
+                    if any(not l.strip() for l in _ov_lines):
+                        # 空行分组：空行=段分隔，镜头内多行合并为一段
+                        _blocks = [b.strip() for b in re.split(r"\n\s*\n", "\n".join(_ov_lines))
+                                   if b.strip()]
+                        _lines = [re.sub(r"\s*\n\s*", " ", b) for b in _blocks]
+                        _lines = [l for l in _lines
+                                  if l and not l.strip().startswith("#")]
+                    else:
+                        _lines = [l.strip() for l in _ov_lines
+                                  if l.strip() and not l.strip().startswith("#")]
+                if len(_lines) >= 1:
+                    _n = len(_lines)
+                    _per = max(2.0, round(dur / _n, 1))
+                    shot_frames = [self._resolve_length(_per)] * _n
+                    joined_prompt = "\n\n".join(_lines)
+                    print(f"[H3 AutoDirector] bypass+剧本模式(手打): {_n} 镜, 每镜 {_per}s; "
+                          f"概念框按行拆分（不调用 LLM）。", flush=True)
+                    return (joined_prompt, width, height, sum(shot_frames))
+            _line_cnt = (concept_text or "").count("\n") + 1
+            if not script_mode and _line_cnt > 1:
+                print(f"[H3 AutoDirector] 提示：顶部概念框有 {_line_cnt} 行文本，但剧本模式(script_mode)未开启——"
+                      "普通模式只输出 1 段。需要多段分镜：打开『剧本模式（结构化分镜输出）』，"
+                      "或把手打分镜写到 H3PromptSplit 的输入框（每行一段，回车换行=下一段）。",
+                      flush=True)
+            return (prompt_text, width, height, length)
 
         if isinstance(task_mode, (list, tuple)):
             task_mode = task_mode[0] if task_mode else _DEFAULT_TASK_MODE
@@ -1498,7 +2080,9 @@ class H3PromptWriter:
         # 下会把 detailed_description 灌成数百个 [Shot N] 微镜头（≈300 个 shot，
         # 精确到每帧）。这里按时长给一个宏镜头预算（每 2-3 秒一个），配合上面收紧的
         # max_tokens 双重挡住 300-shot 膨胀（指令引导 + token 物理上限）。
-        shot_cap = max(2, math.ceil(dur / 2) + 2)
+        # shot 上限：每 3 秒一个（保守上限，配合"简单场景只出 1 镜"指令）。
+        # 之前 ceil(dur/2)+2 导致 60s 视频被拆成 32 镜，LLM 把上限当目标。
+        shot_cap = max(1, math.ceil(dur / 3))
         if backend == "HTTP endpoint":
             if not llm_base_url.strip():
                 raise ValueError("H3Screenwriter: 'llm_base_url' is empty.")
@@ -1516,6 +2100,17 @@ class H3PromptWriter:
         # dialogue survives inside <d>[Language] ... </d> regardless of how weak
         # the local LLM is — the model can no longer "lose" the spoken lines.
         tagged_concept, _ = MX._tag_dialogue(concept)
+        # v10.3: 剧本模式开启代码级对话保护（引号内台词 -> {{DLG_N}} 占位符 ->
+        # 输出后还原 <d>[语言]原文</d>），弱模型不再可能把台词翻译成英文。
+        if script_mode:
+            protected_concept, dlg_list = _protect_dialogue(concept_text)
+        else:
+            protected_concept, dlg_list = concept, []
+        # v10.4: 行内「」对话标记（兼容"场景描述 + 她说：「台词」"同行格式），
+        # user_brief 用预打 <d> 标签版本；台词原文列表用于输出端校验。
+        _inline_tagged, _inline_contents = _tag_inline_dialogue_lines(concept_text)
+        if _inline_contents:
+            dlg_list = ["「" + c + "」" for c in _inline_contents]
 
         # micxin2025 task-mode system prompt (16 templates incl. action transfer
         # / voice clone / dual dialogue). H3 JSON shot-array contract removed:
@@ -1525,7 +2120,26 @@ class H3PromptWriter:
         csp = (custom_system_prompt or "").strip()
         if script_mode:
             # 剧本模式：专用 JSON 分镜输出提示词（优先级最高，覆盖 task_mode 和 custom_system_prompt）
-            system_prompt = SCRIPT_MODE_SYSTEM_PROMPT
+            # task_mode 选择「分镜模式」时用更严格的分镜转换提示词（镜头数量/顺序与用户一致）
+            if task_key == "shot_split_mode":
+                system_prompt = SHOT_SPLIT_SYSTEM_PROMPT
+            elif task_key in CUSTOM_SKILLS:
+                # 自定义 skill 叠加：保留剧本 JSON 输出契约，把 skill 的导演方法论追加在其后
+                # （skill 的 system_prompt 是纯方法论覆盖层，不含六段式基础，不会与剧本契约冲突）
+                _skill_sp = CUSTOM_SKILLS[task_key]["system_prompt"]
+                system_prompt = SCRIPT_MODE_SYSTEM_PROMPT + "\n\n" + _skill_sp
+            else:
+                system_prompt = SCRIPT_MODE_SYSTEM_PROMPT
+            # 对话保留规则（最高优先级）——所有剧本模式路径统一追加，
+            # 防止本地弱模型把 <d> 内台词翻译/丢弃/编造。
+            _copy_rule = (r"""# Dialogue Copy Rule (script mode, highest priority)
+# The <d>[Language] ... </d> blocks inside the STORY CONCEPT are the user's EXACT
+# dialogue lines. Copy each one VERBATIM (tags + language marker + text) into the
+# corresponding shot's "prompt". NEVER translate, paraphrase, replace, or discard
+# them; NEVER invent different dialogue when a concept line already exists. Losing
+# or rewriting a dialogue block is a hard failure.""")
+            system_prompt = (system_prompt + "\n\n" + MX.DIALOGUE_PRESERVE_RULE
+                             + "\n\n" + _copy_rule)
         elif csp:
             system_prompt = csp
         else:
@@ -1543,8 +2157,48 @@ class H3PromptWriter:
             print(f"[H3 AutoDirector] 资产库联动: {len(char_map)}角色, "
                   f"{len(scene_map)}场景, {len(prop_map)}道具.", flush=True)
 
+        # ---- 翻译模式（script_mode + 分镜模式）：LLM 只做忠实翻译 ----
+        # 不拆镜（拆段由 Split 按手写空行完成）、不扩写、不重构六段式——
+        # 措辞忠实于用户手写，画面可控；输入不规范也不会被错误拆成多段。
+        if script_mode and task_key == "shot_split_mode":
+            if not (concept_text or "").strip():
+                raise ValueError("H3Screenwriter: 分镜模式概念为空 — 请在概念框填写分镜。")
+            # 代码级对话保护：引号内对话 → {{DLG_N}} 占位符，LLM 不会翻译占位符，
+            # 输出后还原原文——对话保留不依赖模型自觉。
+            protected_concept, dlg_list = _protect_dialogue(concept_text)
+            # user message 只放分镜文本：8B 模型会把 user message 里的任何模板行
+            # （VISUAL STYLE / ASPECT RATIO / NOTE）当内容照抄进输出，必须删干净。
+            trans_msg = (
+                f"SHOT LIST (分镜) to convert:\n{protected_concept}"
+            )
+            msgs = [
+                {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
+                {"role": "user", "content": trans_msg},
+            ]
+            translated = _clean_text(_strip_think(
+                self._generate(msgs, temperature, seed, backend, gguf_name,
+                               mmproj_name, n_gpu_layers, context_size, keep_loaded,
+                               llm_base_url, model, api_key) or ""))
+            if not translated:
+                raise ValueError("H3Screenwriter: 翻译模式返回为空 — 请检查 LLM 配置。")
+            if dlg_list:
+                translated = _restore_dialogue(translated, dlg_list)
+            # ---- 兜底：LLM 输出废了（模板泄漏/没翻译/空行结构被破坏）→ 直通用户原文 ----
+            # 直通后 Split 按用户手写空行拆段照常工作，ClipChain AV 的
+            # auto_h3_compile + auto_dialogue 自动补六段式和 <d> 对话标签。
+            if _translation_failed(concept_text, translated, len(dlg_list)):
+                print(f"[H3 AutoDirector] 翻译模式输出异常，降级直通用户原文 "
+                      f"({len((concept_text or '').strip())} chars)——由 Split "
+                      f"按空行拆段、ClipChain 自动六段式+<d>对话包装。", flush=True)
+                translated = (concept_text or "").strip()
+            print(f"[H3 AutoDirector] 翻译模式: 输出 {len(translated)} chars "
+                  f"(对话保护 {len(dlg_list)} 处, 拆段由 Split 按空行完成).", flush=True)
+            # 输出一段翻译文本（保留空行结构）→ Split 按用户手写空行拆段
+            # length 用总时长帧数（段级时长由 ClipChain 面板控制）
+            return (translated, width, height, self._resolve_length(dur))
+
         user_brief = (
-            f"STORY CONCEPT (may be Chinese): {tagged_concept}\n"
+            f"STORY CONCEPT (may be Chinese): {_inline_tagged if _inline_contents else tagged_concept}\n"
             f"VISUAL STYLE: {style_contract}\n"
             f"TOTAL DURATION: {dur} seconds (H3 hard cap 15s). "
             f"Plan the detailed_description timeline within this budget.\n"
@@ -1558,12 +2212,28 @@ class H3PromptWriter:
         # 运镜短语/时机已移除（用户反馈导致闪退，改为纯概念驱动镜头语言）。
         # v10: 剧本模式用 JSON 分镜输出要求，普通模式用六段式文本要求。
         if script_mode:
-            user_brief += (
-                f"SHOT BUDGET: total duration = {dur} seconds. Split into {shot_cap} shots max, "
-                f"each shot 2-6 seconds. The sum of all shot durations MUST equal {dur}. "
-                f"Output the structured JSON screenplay now (characters + scenes + shots). "
-                f"Each shot's 'prompt' field is a complete self-contained H3 prompt for that shot alone."
-            )
+            if task_key == "shot_split_mode":
+                user_brief += (
+                    f"SHOT BUDGET (STRICT SPLIT MODE): the user input IS a shot list — split EXACTLY "
+                    f"along the user's markers (镜头N / Shot N / 【切场】 / blank-line separated blocks), "
+                    f"same count, same order. FORBIDDEN: merge, add, drop, re-split or reorder. "
+                    f"Total duration MUST equal {dur} seconds; honor per-shot durations if tagged. "
+                    f"Each shot 2-6 seconds. Output the structured JSON screenplay now "
+                    f"(characters + scenes + shots). Each shot's 'prompt' field is a complete "
+                    f"self-contained H3 prompt for that shot alone."
+                )
+            else:
+                user_brief += (
+                    f"SHOT BUDGET: total duration = {dur} seconds. If the concept EXPLICITLY marks shots "
+                    f"(镜头N / Shot N / 【切场】 / blank-line separated blocks), output EXACTLY that many "
+                    f"shots in the same order — never merge marked shots. Only when NO shot markers exist, "
+                    f"infer the count from narrative complexity: one continuous scene = EXACTLY 1 shot; "
+                    f"split only on explicit scene changes / time jumps / distinct action phases. "
+                    f"{shot_cap} is the absolute upper bound, NOT a target. Each shot 2-6 seconds. "
+                    f"The sum of all shot durations MUST equal {dur}. "
+                    f"Output the structured JSON screenplay now (characters + scenes + shots). "
+                    f"Each shot's 'prompt' field is a complete self-contained H3 prompt for that shot alone."
+                )
         else:
             user_brief += (
                 f"HARD SHOT BUDGET (violating breaks the render pipeline): the "
@@ -1611,13 +2281,37 @@ class H3PromptWriter:
                       flush=True)
                 img_contents = []
             elif script_mode:
-                # v10.2: 剧本模式下不把资产库图片传给 LLM。
-                # LLM 只需要资产的名称+描述（已在 user_brief 中通过 _build_asset_brief 注入），
-                # 图片是给 H3 渲染节点用的（通过 _aio_ref_paths 同步到 AIO）。
-                # 把 28 张图传给 Qwen3-VL 会导致内存不足 / Media evaluation failed。
-                print(f"[H3 AutoDirector] 剧本模式：跳过 {len(img_contents)} 张参考图的视觉反推"
-                      f"（LLM 只用文本描述，图片供渲染使用）。", flush=True)
-                img_contents = []
+                # v10.7: 剧本模式放开视觉反推（限量）。
+                # v10.2 曾一刀切跳过：资产库联动会把 28 张图全塞给 VLM，
+                # 导致内存不足 / Media evaluation failed。少量参考图（四视图
+                # 等 ≤ _SCRIPT_VISUAL_MAX 张）不存在该问题——LLM 看到图才能
+                # 把人物穿搭/外貌锁进每镜描述，否则生成时穿搭随机。
+                _SCRIPT_VISUAL_MAX = 4
+                if len(img_contents) > _SCRIPT_VISUAL_MAX:
+                    print(f"[H3 AutoDirector] 剧本模式：{len(img_contents)} 张参考图超过视觉反推"
+                          f"上限({_SCRIPT_VISUAL_MAX})，跳过看图（LLM 只用文本描述，图片供渲染使用）。",
+                          flush=True)
+                    # 但仍要告诉 LLM「有图、要保留 <Picture N> 标签」——
+                    # 否则弱模型不知道图片存在，生成的 prompt 里丢标签，首帧/参考图全失效。
+                    user_brief += (
+                        f"\nREFERENCE IMAGES AVAILABLE: {len(img_contents)} image(s) are attached "
+                        f"for RENDERING (not for visual analysis — do not describe their pixels). "
+                        f"If the user's concept references them with <Picture N> tags, you MUST "
+                        f"restate the exact same <Picture N> tag in EVERY shot prompt that uses that "
+                        f"image (verbatim). NEVER invent a <Picture N> the concept did not include.\n"
+                    )
+                    img_contents = []
+                else:
+                    print(f"[H3 AutoDirector] 剧本模式：{len(img_contents)} 张参考图送视觉反推"
+                          f"(上限 {_SCRIPT_VISUAL_MAX}，VLM 看图锁定人物/穿搭)。", flush=True)
+                    user_brief += (
+                        f"\nREFERENCE IMAGES ATTACHED (visual): {len(img_contents)} image(s) are "
+                        f"provided visually — ANALYZE them and LOCK the subject's identity, outfit, "
+                        f"hair, props and scene into EVERY shot's detailed_description so the "
+                        f"generated video stays consistent with the reference. Restate the exact "
+                        f"<Picture 1>..<Picture {len(img_contents)}> tag verbatim in every shot "
+                        f"prompt that shows the subject. NEVER invent assets beyond these images.\n"
+                    )
             else:
                 user_brief += (
                     f"\nREFERENCE IMAGES ATTACHED: {len(img_contents)} image(s) are "
@@ -1635,6 +2329,38 @@ class H3PromptWriter:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
+
+        # v10.8: LLM 输出缓存 —— 同一概念/参数只反推一次。
+        # 命中时跳过 LLM（含修正重试），直接复用上次反推的最终分镜，
+        # 保证提示词字节级不变 → 下游 ClipChain 段缓存可稳定命中。
+        _llm_cache_key = None
+        if script_mode and task_key != "shot_split_mode":
+            _llm_cache_key = _make_llm_cache_key(
+                concept_text, task_key, script_mode, aspect_ratio, resolution_mp,
+                dur, backend, gguf_name, mmproj_name, context_size, model,
+                llm_base_url, custom_system_prompt, _aio_ref_paths, asset_library)
+            _cached = _llm_cache_load(_llm_cache_key)
+            if _cached is not None:
+                try:
+                    _c_characters, _c_scenes, _c_shots = _cached
+                    if not _c_shots:
+                        raise ValueError("缓存空分镜")
+                    shot_frames = _shots_to_frame_list(_c_shots)
+                    joined_prompt = _shots_to_joined_prompt(_c_shots)
+                    shots_prompts = [s["prompt"] for s in _c_shots]
+                    shot_characters = [",".join(s["characters"]) for s in _c_shots]
+                    shot_scenes = [s["scene"] for s in _c_shots]
+                    characters_json = json.dumps(_c_characters, ensure_ascii=False)
+                    scenes_json = json.dumps(_c_scenes, ensure_ascii=False)
+                    total_length = sum(shot_frames)
+                    print(f"[H3 AutoDirector] LLM 输出缓存命中: {len(_c_shots)} 镜"
+                          f"(key {_llm_cache_key[:8]}…)，跳过 LLM 反推。", flush=True)
+                    return (json.dumps(shots_prompts, ensure_ascii=False),
+                            width, height, total_length)
+                except Exception as e:
+                    print(f"[H3 AutoDirector] LLM 缓存命中但重建输出失败，"
+                          f"重新反推: {e}", flush=True)
+                    _llm_cache_key = None
 
         try:
             prompt_text = self._generate(messages, temperature, seed, backend, gguf_name,
@@ -1659,10 +2385,91 @@ class H3PromptWriter:
             if err:
                 raise ValueError(f"H3Screenwriter 剧本模式解析失败: {err}")
             characters, scenes, shots_list = _validate_and_normalize_script(data, dur)
+            # v10.9: 主路径还原 {{DLG_N}} -> <d>[语言] 原文</d>（代码级对话保留）。
+            # LLM 反推时概念里的 <d> 块/引号台词已被保护为占位符，输出必须还原，
+            # 否则弱模型要么丢弃占位符、要么自己包一层格式错误的 <d>。
+            if dlg_list:
+                for _s in shots_list:
+                    _s["prompt"] = _restore_dialogue(_s["prompt"], dlg_list)
+            # v10.6: 对话保底（主 LLM 路径）——台词原文必须出现在输出里，
+            # 空 prompt 镜头也会被发现；缺失则修正重试一次，再兜底注入台词。
+            if dlg_list:
+                import re as _re3
+                _dlg_contents = [_re3.sub(r'^[「『\u201c\"\u201d]+|[」』\u201d\"\u201c]+$', '', d)
+                                 for d in dlg_list]
+
+                def _miss_of(_shots):
+                    _j = "".join(_s.get("prompt", "") for _s in _shots)
+                    return [c for c in _dlg_contents if c and c not in _j]
+
+                _has_empty = any(not _s.get("prompt", "").strip() for _s in shots_list)
+                _missing = _miss_of(shots_list)
+                if _missing or _has_empty:
+                    print(f"[H3 AutoDirector] 剧本模式检测到台词丢失 {_missing}"
+                          + ("/空镜头" if _has_empty else "") + "，修正重试一次...", flush=True)
+                    _retry_msgs = messages + [
+                        {"role": "assistant", "content": prompt_text},
+                        {"role": "user", "content": (
+                            "CORRECTION: you dropped script dialogue or left a shot's "
+                            "detailed_description empty. You MUST include each of these "
+                            "lines VERBATIM inside <d>[Language] ... </d> in the matching "
+                            "shot's prompt: " + json.dumps(_dlg_contents, ensure_ascii=False)
+                            + ". Keep exactly %d shots (one per story beat) and give EVERY "
+                              "shot a complete non-empty detailed_description. Never "
+                              "translate or paraphrase. Regenerate the full JSON screenplay now."
+                              % len(shots_list))}
+                    ]
+                    _retry_text = self._generate(_retry_msgs, temperature, seed, backend,
+                                                 gguf_name, mmproj_name, n_gpu_layers,
+                                                 context_size, keep_loaded,
+                                                 llm_base_url, model, api_key) or ""
+                    _retry_data, _retry_err = _extract_script_json(_retry_text)
+                    if not _retry_err:
+                        _rc, _rs, _rshots = _validate_and_normalize_script(_retry_data, dur)
+                        if _rshots:
+                            _miss2 = _miss_of(_rshots)
+                            _empty2 = any(not _s.get("prompt", "").strip() for _s in _rshots)
+                            _score1 = len(_missing) + (1 if _has_empty else 0)
+                            _score2 = len(_miss2) + (1 if _empty2 else 0)
+                            if _score2 < _score1:
+                                characters, scenes, shots_list = _rc, _rs, _rshots
+                                print(f"[H3 AutoDirector] 修正重试成功: {len(shots_list)} 镜，"
+                                      f"缺失降至 {len(_miss2)}。", flush=True)
+                            else:
+                                print("[H3 AutoDirector] 修正重试未改善，保留第一次输出。",
+                                      flush=True)
+                    else:
+                        print(f"[H3 AutoDirector] 修正重试仍失败: {_retry_err} (保留第一次输出)",
+                              flush=True)
+                # v10.6b: 兜底注入——仍缺失的台词按概念顺序补进对应镜头（第N句->第N镜）
+                _jf = "".join(_s.get("prompt", "") for _s in shots_list)
+                _still = [c for c in _dlg_contents if c and c not in _jf]
+                for _k, _c in enumerate(_dlg_contents):
+                    if _c in _still:
+                        _tgt = shots_list[_k] if _k < len(shots_list) else shots_list[-1]
+                        # <d> 块原样注入（保留语言标记）；引号台词按 H3 格式包裹
+                        if _re3.match(r'^<d>(\[[^\]]*\])?\s*.*?</d>$', _c, flags=_re3.S):
+                            _inject = _c
+                        else:
+                            _lang = _detect_dialogue_language(_c)
+                            _inject = '<d>[%s] %s</d>' % (_lang, _c)
+                        _tgt["prompt"] = (_tgt.get("prompt", "").rstrip() + " " + _inject)
+                if _still:
+                    print(f"[H3 AutoDirector] 台词兜底注入 {len(_still)} 句: {_still}", flush=True)
+                _jf2 = "".join(_s.get("prompt", "") for _s in shots_list)
+                _still2 = [c for c in _dlg_contents if c and c not in _jf2]
+                _empty3 = [i + 1 for i, _s in enumerate(shots_list)
+                           if not _s.get("prompt", "").strip()]
+                if _still2 or _empty3:
+                    print(f"[H3 AutoDirector] 警告: 最终仍有台词缺失 {_still2} / 空镜头 {_empty3}",
+                          flush=True)
             # v10.1: 把资产库的图片路径/描述合并到输出的 characters/scenes
             if has_assets:
                 characters, scenes = _merge_assets_into_output(
                     characters, scenes, char_map, scene_map)
+            # v10.8: 写 LLM 输出缓存（同一概念/参数下次直接命中，无需重跑 LLM）
+            if _llm_cache_key:
+                _llm_cache_save(_llm_cache_key, [characters, scenes, shots_list])
             shot_frames = _shots_to_frame_list(shots_list)
             joined_prompt = _shots_to_joined_prompt(shots_list)
             shots_prompts = [s["prompt"] for s in shots_list]
@@ -1675,20 +2482,24 @@ class H3PromptWriter:
                   f"总时长 {dur}s, 总帧数 {total_length}."
                   + (f" 资产联动: {len(char_map)}角色/{len(scene_map)}场景." if has_assets else ""),
                   flush=True)
-            return (joined_prompt, width, height, total_length,
-                    shots_prompts, shot_frames, shot_characters, shot_scenes,
-                    characters_json, scenes_json)
+            return (json.dumps(shots_prompts, ensure_ascii=False), width, height, total_length)
 
         # 普通模式：把分辨率 / 时长直接作为 INT 输出，驱动下游 Ref2VA。
         # 新增的 6 个剧本模式端口返回空值，旧工作流不受影响。
-        return (prompt_text, width, height, length,
-                [], [], [], [], "", "")
+        _line_cnt = (concept_text or "").count("\n") + 1
+        if not script_mode and _line_cnt > 1:
+            print(f"[H3 AutoDirector] 提示：顶部概念框有 {_line_cnt} 行文本，但剧本模式(script_mode)未开启——"
+                  "普通模式只输出 1 段。需要多段分镜：打开『剧本模式（结构化分镜输出）』，"
+                  "或把手打分镜写到 H3PromptSplit 的输入框（每行一段，回车换行=下一段）。",
+                  flush=True)
+        prompt_text = _fix_dialect_tags(prompt_text, concept_text or "")
+        return (prompt_text, width, height, length)
 
     # ---- LLM call ----------------------------------------------------------
     @staticmethod
     def _call_llm(url, model, api_key, messages, temperature, seed,
-                  timeout=120, max_retries=1, retry_delay=8,
-                  disable_thinking=True, overall_timeout=150):
+                  timeout=360, max_retries=1, retry_delay=8,
+                  disable_thinking=True, overall_timeout=420):
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -1708,6 +2519,7 @@ class H3PromptWriter:
         last_err = None
         drop_kwargs = False
         # 总超时护栏：无论单次 urlopen 怎么卡，整体最多 overall_timeout 秒后一定
+# （2026-09-05: 120/150 -> 360/420，35B + 41KB 知识 prefill 在 16G 上常超 150s）
         # 失败，避免 ComfyUI 单线程 prompt 执行被长时间阻塞（曾导致前端全局禁用
         # 画布、所有输入框变灰、需刷新浏览器才恢复）。纯单线程 + time.monotonic，
         # 无信号/线程泄漏风险，Windows 安全。
@@ -1776,9 +2588,17 @@ class H3PromptWriter:
                 if attempt < max_retries - 1:
                     time.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
                     continue
+        hint = ""
+        if last_err is not None:
+            msg = str(last_err).lower()
+            if "10061" in msg or "connection refused" in msg or "actively refused" in msg:
+                hint = (
+                    "\n[提示] LLM 服务未启动（连接被拒绝）。请先双击 "
+                    "K:\\llamacuda131\\Qwen3.6-35B-IQ2_M.bat 启动 35B + 知识库代理（8081），"
+                    "等窗口显示就绪后再跑；或把 backend 切回 'Local GGUF' 用本地模型。")
         raise RuntimeError(
             f"H3Screenwriter: LLM call failed after {max_retries} attempts: "
-            f"{last_err}")
+            f"{last_err}{hint}")
 
     def _generate(self, messages, temperature, seed, backend, gguf_name,
                   mmproj_name, n_gpu_layers, n_ctx, keep_loaded,

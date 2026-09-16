@@ -207,6 +207,8 @@ function buildMediaGrid(cfg) {
         bumpUpdate();
         refresh();
         if (onChanged) onChanged();
+        // 广播素材变更事件：让 H3 PromptWriter 立即同步图片路径（不等 2 秒轮询）
+        try { window.dispatchEvent(new CustomEvent("h3:aio-media-updated")); } catch (e) {}
     }
 
     async function handleFiles(files) {
@@ -520,6 +522,8 @@ function buildKeyframeGrid(cfg) {
         bumpUpdate();
         refresh();
         if (onChanged) onChanged();
+        // 广播素材变更事件：让 H3 PromptWriter 立即同步图片路径（不等 2 秒轮询）
+        try { window.dispatchEvent(new CustomEvent("h3:aio-media-updated")); } catch (e) {}
     }
 
     // 面板级拖放/批量：图片/视频→media，音频→audio（优先填空槽，否则新建槽）
@@ -1075,9 +1079,41 @@ function buildAIOMediaLoader(node) {
     };
     document.addEventListener("paste", pasteHandler, { capture: true });
 
+    // 外部 IMAGE 入库联动：监听执行完成，把 media_report 中 "[外部入库]" 的图片
+    // 自动合并进素材库图片 tab 并写回 image_paths（持久化，下次打开工作流仍在）。
+    const _ingestHandler = (e) => {
+        try {
+            const d = e && e.detail;
+            if (!d || !d.output) return;
+            const nid = (d.node && typeof d.node === "object") ? d.node.id : d.node;
+            if (nid !== node.id && d.display_node !== node.id) return;
+            let report = "";
+            (Array.isArray(d.output) ? d.output : []).forEach(o => {
+                if (typeof o === "string" && o.indexOf("[外部入库]") >= 0) report = o;
+            });
+            if (!report) return;
+            const newItems = [];
+            report.split(/\r?\n/).forEach(line => {
+                const m = line.match(/\[外部入库\]\s*(\S+\.png)/);
+                if (m && m[1]) newItems.push({ path: m[1], start: 0, end: 0 });
+            });
+            if (!newItems.length) return;
+            const cur = grids.image.getItems();
+            const seen = new Set(cur.map(it => it.path));
+            const added = newItems.filter(it => !seen.has(it.path));
+            if (added.length) {
+                grids.image.setItems(added.concat(cur).slice(0, 9));
+            }
+        } catch (err) { console.error("H3 AIO ingest sync error", err); }
+    };
+    if (typeof api !== "undefined" && api.addEventListener) {
+        api.addEventListener("executed", _ingestHandler);
+    }
+
     const origOnRemoved = node.onRemoved;
     node.onRemoved = function () {
         document.removeEventListener("paste", pasteHandler, { capture: true });
+        try { if (typeof api !== "undefined" && api.removeEventListener) api.removeEventListener("executed", _ingestHandler); } catch (err) {}
         if (origOnRemoved) origOnRemoved.apply(this, arguments);
     };
 
@@ -1100,5 +1136,7 @@ app.registerExtension({
         if (node.comfyClass === "H3ModelLoader") {
             buildAIOMediaLoader(node);
         }
+        // H3InfiniteStoryWriter：素材槽/图片槽已按用户要求移除（2026-09-12），
+        // 图片统一由 H3ModelLoader (AIO) 素材库管理，JS 自动同步到 _aio_ref_paths。
     },
 });

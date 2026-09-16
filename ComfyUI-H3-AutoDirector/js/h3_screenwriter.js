@@ -26,6 +26,15 @@ import { ensureAllTooltipsShown } from "./tooltip_hooker.js";
 import { ensureMigrationsApplied } from "./widget_value_migrator.js";
 
 const NODE_CLASS = "H3PromptWriter";
+// v11: 同一套 @ 素材弹窗 / AIO 图片同步 / 折叠逻辑同时服务两个节点：
+// H3PromptWriter（concept_text）与 H3InfiniteStoryWriter（concept）。
+const NODE_CLASSES = ["H3PromptWriter", "H3InfiniteStoryWriter"];
+function isH3Node(comfyClass) {
+    return NODE_CLASSES.indexOf(comfyClass) !== -1;
+}
+function getConceptWidgetName(node) {
+    return (node && node.comfyClass === "H3InfiniteStoryWriter") ? "concept" : "concept_text";
+}
 const CONCEPT_WIDGET_NAME = "concept_text";  // INPUT_TYPES.required 第一位 (节点顶部 widgets[0], v7.2.1 起)
 
 // v8: 高级 LLM 设置折叠组 —— advanced_settings 收起时这些 widget 全部 fold。
@@ -98,7 +107,7 @@ const TASK_MODE_CONCEPT_EXAMPLES = {
 
 function applyTaskModeConcept(node) {
     const tm = getWidget(node, "task_mode");
-    const cw = getWidget(node, CONCEPT_WIDGET_NAME);
+    const cw = getWidget(node, getConceptWidgetName(node));
     if (!tm || !cw) return;
     const sample = TASK_MODE_CONCEPT_EXAMPLES[tm.value];
     if (!sample) return;  // 官方示例模式 → 不填充，保留空白
@@ -176,7 +185,7 @@ function applyAdvancedVisibility(node) {
    第一位 = widgets[0])，强制 computeSize 返回大尺寸。textarea 上挂 @ 监听。
    这里不调任何 addDOMWidget —— LiteGraph 原生 widget 是 ComfyUI 最稳的元素。 */
 function enlargeConceptWidget(node) {
-    const w = getWidget(node, CONCEPT_WIDGET_NAME);
+    const w = getWidget(node, getConceptWidgetName(node));
     if (!w) return;
 
     // 1. 强制尺寸（160px, ~6-7 行文本可见，原 320px 缩小一半）。
@@ -439,9 +448,18 @@ function syncAIOImagePaths(node) {
     const targetW = node.widgets.find(w => w && w.name === "_aio_ref_paths");
     if (!targetW) return;
     const nodes = (app.graph && app.graph.nodes) ? app.graph.nodes : [];
+    const aioNodes = nodes.filter(n => n && n.comfyClass === "H3ModelLoader" && n.widgets);
+    // 1) AIO → Writer：汇总【本节点 GUI 图片槽 image_paths】+ 所有 AIO 的 image_paths
+    //    （本节点内嵌素材 UI 写入 image_paths，一并进 _aio_ref_paths 供 LLM 看图，
+    //      随后步骤 2 反向推给 AIO 渲染端。）
     const allPaths = [];
-    for (const n of nodes) {
-        if (!n || n.comfyClass !== "H3ModelLoader" || !n.widgets) continue;
+    const ownImgW = node.widgets.find(w => w && w.name === "image_paths");
+    if (ownImgW && ownImgW.value) {
+        String(ownImgW.value).split("\n").map(l => l.trim()).filter(Boolean).forEach(line => {
+            if (line && !allPaths.includes(line)) allPaths.push(line);
+        });
+    }
+    for (const n of aioNodes) {
         const imgW = n.widgets.find(w => w && w.name === "image_paths");
         if (imgW && imgW.value) {
             String(imgW.value).split("\n").map(l => l.trim()).filter(Boolean).forEach(line => {
@@ -454,20 +472,53 @@ function syncAIOImagePaths(node) {
         targetW.value = newVal;
         try { if (targetW._state) targetW._state.value = newVal; } catch (e) {}
     }
+    // 2) Writer → AIO（反向同步）：Writer 的 _aio_ref_paths 可能含资产库图片
+    //    （Python 端在 execute 时把 AssetLibrary 的图路径合并进来）。
+    //    合并回每个 AIO 的 image_paths，保证渲染端参考图 = AIO 手动图 + 资产图。
+    //    只增不删、幂等（值相同不写），不会形成死循环。
+    const writerPaths = String(targetW.value || "").split("\n").map(l => l.trim()).filter(Boolean);
+    for (const n of aioNodes) {
+        const imgW = n.widgets.find(w => w && w.name === "image_paths");
+        if (!imgW) continue;
+        const cur = String(imgW.value || "").split("\n").map(l => l.trim()).filter(Boolean);
+        let changed = false;
+        for (const p of writerPaths) {
+            if (p && !cur.includes(p)) { cur.push(p); changed = true; }
+        }
+        if (changed) {
+            imgW.value = cur.join("\n");
+            try { if (imgW._state) imgW._state.value = imgW.value; } catch (e) {}
+            try { if (app.graph) app.graph.setDirtyCanvas(true, true); } catch (e) {}
+        }
+    }
 }
 
 // 全局定时器：每 2 秒同步一次 AIO 图片路径（覆盖所有 Screenwriter 节点）
 let _aioSyncTimer = null;
+let _aioSyncEvt = false;
 function ensureAIOSyncTimer() {
     if (_aioSyncTimer) return;
     _aioSyncTimer = setInterval(() => {
         try {
             const nodes = (app.graph && app.graph.nodes) ? app.graph.nodes : [];
             for (const n of nodes) {
-                if (n && n.comfyClass === "H3Screenwriter") syncAIOImagePaths(n);
+                // 注意：节点实际注册类名是 H3PromptWriter（旧名 H3Screenwriter 曾导致定时器永不匹配）
+                if (n && isH3Node(n.comfyClass)) syncAIOImagePaths(n);
             }
         } catch (e) {}
     }, 2000);
+    // 事件驱动：AIO 素材变更时立即同步（不等 2 秒轮询）
+    if (!_aioSyncEvt) {
+        _aioSyncEvt = true;
+        try {
+            window.addEventListener("h3:aio-media-updated", () => {
+                const nodes = (app.graph && app.graph.nodes) ? app.graph.nodes : [];
+                for (const n of nodes) {
+                    if (n && isH3Node(n.comfyClass)) syncAIOImagePaths(n);
+                }
+            });
+        } catch (e) {}
+    }
 }
 
 function openOrUpdateMenu(node, textarea, widget) {
@@ -594,7 +645,7 @@ function ensureH3OutputTooltip() {
 
 /* ---- attachEditor (called from nodeCreated / onConfigure) ---- */
 function attachEditor(node) {
-    if (!node || !node.comfyClass || node.comfyClass !== NODE_CLASS) return;
+    if (!node || !node.comfyClass || !isH3Node(node.comfyClass)) return;
 
     // 0. 概念 widget (widgets[0], 原生 STRING, multiline) — 强制大尺寸 + @ 监听
     enlargeConceptWidget(node);
@@ -638,7 +689,7 @@ function attachEditor(node) {
         seed:                  "🎲 种子 (0=随机)",
         n_gpu_layers:          "🧊 GPU 层数 (-1=全部)",
         keep_loaded:           "🔁 写完不卸 (勾选=每次写都重载)",
-        bypass_llm:            "⏭ 绕过 VL 4B (用顶部概念框粘贴提示词)",
+        bypass_llm:            "⏭ 绕过 LLM (用顶部概念框粘贴提示词)",
     };
     for (const [key, lbl] of Object.entries(labelPatch)) {
         const w = getWidget(node, key);
@@ -691,17 +742,19 @@ function attachEditor(node) {
     setTimeout(() => applyAdvancedVisibility(node), 250);
     setTimeout(() => applyAdvancedVisibility(node), 800);
 
-    // 4. output tooltip
+    // 4. output tooltip（仅 H3PromptWriter；编剧节点输出含义不同，不挂）
     try {
-        node.__h3OutputTooltips = H3_OUTPUT_TOOLTIPS;
-        ensureH3OutputTooltip();
+        if (node.comfyClass === NODE_CLASS) {
+            node.__h3OutputTooltips = H3_OUTPUT_TOOLTIPS;
+            ensureH3OutputTooltip();
+        }
     } catch (e) {}
 
     // 5. 节点宽自适应：按 widget label + value 最长字符串算出最小可视宽
     try {
         const candidates = [];
         candidates.push("http://127.0.0.1:8080/v1/chat/completions");
-        candidates.push("Qwen3-VL-8B-Instruct-abliterated-v2.0.Q4_K_M");
+        candidates.push("minimax-h3-prompt-rewriter-8b-Q8_0.gguf");
         candidates.push("Local GGUF", "HTTP endpoint");
         const ggufW = node.widgets.find((w) => w.name === "gguf_name");
         if (ggufW && ggufW.options && Array.isArray(ggufW.options.values)) {
@@ -728,11 +781,59 @@ function attachEditor(node) {
     } catch (e) {}
 }
 
+/* ---- 官方 H3 提示词嵌入（datalist 下拉 + 自由输入） ---- */
+const OFFICIAL_EMBEDDINGS = [
+    ["bullet_time", "子弹时间"],
+    ["truman_show", "楚门世界"],
+    ["four_seasons", "四季更替"],
+    ["storm_magic", "风暴魔法"],
+    ["art_is_explosion", "爆炸艺术"],
+    ["kiss_camera", "接吻镜头"],
+    ["fire_breath", "火焰吐息"],
+    ["blooming_flowers", "花朵绽放"],
+    ["dark_magic", "黑暗魔法"],
+    ["spiral_ascent", "螺旋上升"],
+];
+
+function ensureEmbeddingDatalist() {
+    let dl = document.getElementById("h3-official-embeddings-datalist");
+    if (dl) return dl;
+    dl = document.createElement("datalist");
+    dl.id = "h3-official-embeddings-datalist";
+    OFFICIAL_EMBEDDINGS.forEach(([v, t]) => {
+        const o = document.createElement("option");
+        o.value = v;
+        o.textContent = t;
+        dl.appendChild(o);
+    });
+    document.body.appendChild(dl);
+    return dl;
+}
+
+function attachEmbeddingDatalist(node) {
+    const w = getWidget(node, "embeddings");
+    if (!w) return;
+    const tryAttach = () => {
+        const el = w.element;
+        if (!el || typeof el.setAttribute !== "function") {
+            setTimeout(tryAttach, 120);
+            return;
+        }
+        if (el.tagName === "INPUT") {
+            ensureEmbeddingDatalist();
+            el.setAttribute("list", "h3-official-embeddings-datalist");
+            el.setAttribute("placeholder", "点右侧下拉选官方嵌入，或自由输入；多个用逗号分隔");
+        }
+        // textarea 不支持 datalist，保留自由输入即可
+    };
+    requestAnimationFrame(tryAttach);
+}
+
 /* ---- extension registration ---- */
 app.registerExtension({
     name: "ComfyUI-H3-AutoDirector.H3Screenwriter",
     async beforeRegisterNodeDef(nodeType, comfyClass) {
-        if (comfyClass !== NODE_CLASS) return;
+        if (!isH3Node(comfyClass)) return;
         const _origOnConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function (info) {
             const r = _origOnConfigure ? _origOnConfigure.apply(this, arguments) : undefined;
@@ -748,9 +849,12 @@ app.registerExtension({
     },
     nodeCreated(node) {
         attachEditor(node);
+        attachEmbeddingDatalist(node);
         try {
-            node.__h3OutputTooltips = H3_OUTPUT_TOOLTIPS;
-            ensureH3OutputTooltip();
+            if (node.comfyClass === NODE_CLASS) {
+                node.__h3OutputTooltips = H3_OUTPUT_TOOLTIPS;
+                ensureH3OutputTooltip();
+            }
         } catch (e) {}
         ensureAllTooltipsShown(node);
         // schema migration

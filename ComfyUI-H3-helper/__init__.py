@@ -6,7 +6,7 @@ This package hosts the V3 io.ComfyNode nodes:
   * H3ModelLoader               (H3 R2VA AIO — loader + Ref2VA + embedded drag-and-drop media uploader)
   * H3SeparateAVLatent          (split a joint H3 AV latent into video + audio)
   * H3CombineAVLatent           (recombine video + audio latents into a joint AV latent)
-
+ 
 All three register through a single V3 comfy_entrypoint (ComfyExtension), under
 the `H3 helper/micxin` category. The companion V2 node packs
 (ComfyUI-H3-AutoDirector, ComfyUI-H3-Prompt-Writing-micxin2025) live in their
@@ -21,12 +21,15 @@ from typing_extensions import override
 
 from .h3_model_loader import H3ModelLoader
 from .h3_av_latent import H3SeparateAVLatent, H3CombineAVLatent
+from .h3_clip_chain_av import H3ClipChainAV
+from .h3_infinite_human import H3InfiniteHumanMV
 
 
 class H3HelperExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [H3ModelLoader, H3SeparateAVLatent, H3CombineAVLatent]
+        return [H3ModelLoader, H3SeparateAVLatent, H3CombineAVLatent,
+                H3ClipChainAV, H3InfiniteHumanMV]
 
 
 async def comfy_entrypoint() -> H3HelperExtension:

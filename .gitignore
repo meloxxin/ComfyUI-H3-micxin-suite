@@ -43,3 +43,7 @@ desktop.ini
 output/
 temp/
 *.log
+
+# LLM response cache (contains prompt/dialogue content)
+llm_cache/
+.pytest_cache/

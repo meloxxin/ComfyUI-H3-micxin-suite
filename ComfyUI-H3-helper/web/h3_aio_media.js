@@ -198,7 +198,7 @@ function buildMediaGrid(cfg) {
     }
     function setItems(newItems) {
         if (!pathsWidget) return;
-        const val = newItems.map(it => `${it.path}|${it.start}|${it.end}`).join("\n");
+        const val = newItems.map(it => mediaType === "video" ? `${it.path}|${it.start}|${it.end}|${it.use || ""}` : `${it.path}|${it.start}|${it.end}`).join("\n");
         const tmp = pathsWidget.callback;
         pathsWidget.callback = null;
         pathsWidget.value = val;
@@ -207,6 +207,8 @@ function buildMediaGrid(cfg) {
         bumpUpdate();
         refresh();
         if (onChanged) onChanged();
+        // 广播素材变更事件：让 H3 PromptWriter 立即同步图片路径（不再依赖 2 秒轮询）
+        try { window.dispatchEvent(new CustomEvent("h3:aio-media-updated")); } catch (e) {}
     }
 
     async function handleFiles(files) {
@@ -434,7 +436,7 @@ function buildMediaGrid(cfg) {
 }
 
 // ==========================================================================
-// 构建"关键帧"网格面板（Add Guide for MiniMax H3）
+// 构建“关键帧”网格面板（Add Guide for MiniMax H3）
 // 每个槽 = { media(图片或视频) + audio(可选) + frame_idx }，动态增删、任意多个。
 // 行序列化: media_path|audio_path|frame_idx|media_start|media_end|audio_start|audio_end
 // 帧↔秒换算沿用 H3 数学表达式: 帧→秒 = frame/24 ; 秒→帧 = Math.round(s*24)
@@ -1092,6 +1094,134 @@ function buildAIOMediaLoader(node) {
 }
 
 // ==========================================================================
+// 给 H3InfiniteStoryWriter 添加 AIO 同款图形界面（仅图片槽）
+// 拖拽/上传图片 → 写入隐藏 image_paths widget → 触发 h3:aio-media-updated
+// → h3_screenwriter.js 同步进 _aio_ref_paths（LLM 看图）并反向推给 AIO（渲染端）。
+// 槽位顺序即 <Picture 1..N> 编号。
+// ==========================================================================
+function buildAIOImageSlots(node) {
+    injectStyles();
+
+    const imagePathsW = node.widgets.find(w => w && w.name === "image_paths");
+    const updateW = node.widgets.find(w => w && w.name === "update");
+    const aioRefW = node.widgets.find(w => w && w.name === "_aio_ref_paths");
+    [imagePathsW, updateW, aioRefW].forEach(w => {
+        if (!w) return;
+        w.computeSize = function () { return [0, 0]; };
+        w.draw = function () {};
+        const iv = setInterval(() => { if (w.element) w.element.style.display = "none"; }, 50);
+        setTimeout(() => clearInterval(iv), 1000);
+    });
+
+    function bumpUpdate() {
+        if (!updateW) return;
+        const cur = parseInt(updateW.value, 10);
+        updateW.value = (isNaN(cur) ? 0 : cur) + 1;
+        if (typeof updateW.callback === "function") updateW.callback(updateW.value);
+    }
+
+    const container = document.createElement("div");
+    container.className = "h3-aio-media";
+
+    const grid = buildMediaGrid({
+        node, pathsWidget: imagePathsW, updateWidget: updateW,
+        mediaType: "image", maxItems: 9, accept: "image/*",
+        bumpUpdate, onChanged: updateStatus,
+    });
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "width:100%;position:relative;";
+    wrap.appendChild(grid.panel);
+    container.appendChild(wrap);
+
+    const status = document.createElement("div");
+    status.className = "h3-aio-status";
+    status.textContent = "参考图 0/9 — 拖拽/上传图片，顺序即 <Picture 1..N>，自动同步 AIO 渲染端";
+    container.appendChild(status);
+
+    function updateStatus() {
+        const n = grid.getItems().length;
+        status.textContent = "参考图 " + n + "/9 — 拖拽/上传图片，顺序即 <Picture 1..N>，自动同步 AIO 渲染端";
+    }
+
+    // 添加为 DOM widget
+    const domWidget = node.addDOMWidget("Gallery", "html_gallery", container, { serialize: false });
+
+    function requestNodeResize() {
+        try {
+            if (node.computeSize) {
+                const sz = node.computeSize();
+                if (sz && sz[1]) {
+                    const targetH = Math.max(200, Math.round(sz[1]) + 16);
+                    const targetW = Math.max(200, node.size?.[0] || sz[0] || 200);
+                    node.setSize([targetW, targetH]);
+                }
+            }
+            app.graph.setDirtyCanvas(true, true);
+        } catch (e) {}
+    }
+
+    domWidget.computeSize = function (width) {
+        const nodeWidth = node.size?.[0] || width || 220;
+        const topbarH = grid.panel.querySelector(".h3-aio-topbar")?.offsetHeight || 28;
+        const gridwrap = grid.panel.querySelector(".h3-aio-gridwrap");
+        const gridContentH = gridwrap ? Math.min(gridwrap.scrollHeight || 120, 280) : 120;
+        const statusH = status.offsetHeight || 24;
+        return [Math.max(10, nodeWidth - 30), Math.max(topbarH + gridContentH + statusH + 32, 200)];
+    };
+
+    // 节点级拖放（图片）
+    const origOnDragDrop = node.onDragDrop;
+    node.onDragDrop = function (e) {
+        let handled = false;
+        if (e.dataTransfer && e.dataTransfer.files) {
+            const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith("image/"));
+            if (files.length) { e.preventDefault(); grid.handleFiles(files); handled = true; }
+        }
+        if (!handled && origOnDragDrop) return origOnDragDrop.apply(this, arguments);
+        return handled;
+    };
+    const origOnDragOver = node.onDragOver;
+    node.onDragOver = function (e) {
+        if (e.dataTransfer && e.dataTransfer.items) {
+            const has = Array.from(e.dataTransfer.items).some(f =>
+                f.kind === "file" && f.type.startsWith("image/"));
+            if (has) { e.preventDefault(); return true; }
+        }
+        if (origOnDragOver) return origOnDragOver.apply(this, arguments);
+        return false;
+    };
+
+    // 粘贴
+    const pasteHandler = (e) => {
+        if (app.canvas.selected_nodes && app.canvas.selected_nodes[node.id]) {
+            const items = e.clipboardData?.items;
+            if (!items) return;
+            const files = [];
+            for (let i = 0; i < items.length; i++) {
+                if (items[i].kind !== "file") continue;
+                if (items[i].type.startsWith("image/")) files.push(items[i].getAsFile());
+            }
+            if (files.length) { e.preventDefault(); e.stopImmediatePropagation(); grid.handleFiles(files); }
+        }
+    };
+    document.addEventListener("paste", pasteHandler, { capture: true });
+
+    const origOnRemoved = node.onRemoved;
+    node.onRemoved = function () {
+        document.removeEventListener("paste", pasteHandler, { capture: true });
+        if (origOnRemoved) origOnRemoved.apply(this, arguments);
+    };
+
+    // 初始化
+    grid.refresh();
+    updateStatus();
+    requestAnimationFrame(() => requestNodeResize());
+    setTimeout(() => { grid.refresh(); updateStatus(); requestNodeResize(); }, 150);
+    setTimeout(() => requestNodeResize(), 500);
+    setTimeout(() => requestNodeResize(), 1200);
+}
+
+// ==========================================================================
 // 注册扩展
 // ==========================================================================
 app.registerExtension({
@@ -1100,5 +1230,8 @@ app.registerExtension({
         if (node.comfyClass === "H3ModelLoader") {
             buildAIOMediaLoader(node);
         }
+        // H3InfiniteStoryWriter：素材槽已按用户要求撤下，图片统一由
+        // H3ModelLoader (AIO) 素材库管理，JS 自动同步到 _aio_ref_paths。
+        // 如需恢复内嵌图片槽，把 buildAIOImageSlots(node) 挂回即可。
     },
 });
