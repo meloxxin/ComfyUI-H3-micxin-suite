@@ -17,7 +17,6 @@ MiniMax H3 全流程自定义节点套装，包含**提示词写作**和**全资
 | `H3PromptTranslate` (micxin) | 分段翻译节点：只翻描述、保留对话，N 路进 N 路出，对接 ClipChain segment_prompts |
 | `H3Screenwriter` | 多镜头剧本自动写作，输出 JSON 到 `input/rift_prompts/` |
 | `H3AssetLibrary` | 角色/场景资产管理库，支持参考图绑定 |
-| `H3ReferenceBuilder` | 参考图构建器（从上一段视频抽帧，供接续段使用） |
 
 ### 2. ComfyUI-H3-helper (micxin) — 全资源模型加载
 
