@@ -70,8 +70,6 @@ ComfyUI/models/
 
 | 文件 | 用途 |
 |---|---|
-| `H3_R2VA_AIO_micxin_example.json` | R2VA AIO 全参考单段工作流（官方模型） |
-| `H3_Extender_one_click_drama_example.json` | 一键短剧 Extender 示例 |
 | `H3分镜长视频.json` | 分镜长视频：Prompt Split+Translate → 分镜提示词 → 逐镜渲染 |
 | `H3无限时长数字人.json` | 无限时长数字人：AIO + InfiniteSampler 链式续帧 |
 | `Minimax H3提示词增强.json` | 提示词增强 + 分镜写作链路 |
