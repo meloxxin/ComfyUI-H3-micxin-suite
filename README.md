@@ -15,8 +15,6 @@ MiniMax H3 全流程自定义节点套装，包含**提示词写作**和**全资
 | `H3 Prompt → Segment Prompts` | 把 JSON 提示词拆成逐镜 conditioning 段 |
 | `H3PromptSplitTranslate` (micxin) | 六段式拆分 + 忠实翻译：非对话中文翻译为英文，`<d>` 对话原文保留（JSON 结构不变） |
 | `H3PromptTranslate` (micxin) | 分段翻译节点：只翻描述、保留对话，N 路进 N 路出，对接 ClipChain segment_prompts |
-| `H3Screenwriter` | 多镜头剧本自动写作，输出 JSON 到 `input/rift_prompts/` |
-| `H3AssetLibrary` | 角色/场景资产管理库，支持参考图绑定 |
 
 ### 2. ComfyUI-H3-helper (micxin) — 全资源模型加载
 
@@ -25,7 +23,6 @@ MiniMax H3 全流程自定义节点套装，包含**提示词写作**和**全资
 | `H3ModelLoader` (R2VA AIO) | 全资源输入中心：图片/视频/音频/关键帧统一上传，自带播放器与裁切，集成 MiniMaxH3AddGuide 原生音频驱动 |
 | `H3SeparateAVLatent` | 分离 H3 联合音视频 latent 为视频+音频 |
 | `H3CombineAVLatent` | 合并视频+音频 latent 为联合 AV latent |
-| `H3NoiseMask` | 为 H3 联合 AV latent 构建逐 token 噪声蒙版（局部重绘 / 物体移除 / latent 空间无缝续写） |
 | `H3StitchSegments` | 多段渲染结果去重叠帧拼接为整片（保留原生音频） |
 | `H3ClipChainAV` | 多段 clip 接续：Motion Context 无缝续帧（latent 物理延续），逐镜落盘 |
 | `H3InfiniteHumanMV` | 无限时长数字人 / MV：单节点链式续帧采样器，prompt_json 多镜拆分，直接接 AIO（无需外接图片） |
@@ -159,16 +156,6 @@ lip shapes matching the spoken words
 4. **音频驱动**：配合 longcat / 对白音频标签页，每段自带原生音频。
 5. **收尾拼接**：全部段渲染后，用 `H3StitchSegments` 按顺序拼接（去重叠帧 + 合并音频）。
 
-### H3NoiseMask：latent 空间局部重绘 / 续写
-
-`H3NoiseMask` 生成逐 token 噪声蒙版（ComfyUI #15375）：输出接到
-`SamplerCustomAdvanced` 的 `denoise_mask` 输入，`0` = 保留原 latent 区域、`1` = 重新生成。
-可用于：
-
-- **视频局部重绘 / 物体移除**：`spatial_mask` 传空间蒙版图限制重画区域
-- **latent 空间无缝续写**：把上一段尾帧 latent 区域置 `0`（保留）、新帧置 `1`（重画），
-  即可在 latent 空间继续生成，完全绕开「解码→再喂」的偏色问题（配合二采工作流使用）
-
 ## 本地测试
 
 ```bash
@@ -179,12 +166,14 @@ $env:COMFYUI_ROOT = "你的ComfyUI路径"
 python -m pytest tests -q
 ```
 
-覆盖：提示词嵌入注入、AV latent 拆分合并往返、噪声蒙版构建（时间/空间/翻转）、
-视频段拼接去重、素材行解析与视频用途分流。
+覆盖：提示词嵌入注入、AV latent 拆分合并往返、视频段拼接去重、素材行解析与视频用途分流。
 
-## 关于 micxin2025 模板
+## 致谢
 
-`h3_micxin_assets.py` 中的六段式提示词模板基于 [micxin2025](https://github.com/micxin2025) 的 H3 提示词写作工作流改编，在此致谢。原模板保留了英文叙事 + `<d>[Language]...</d>` 对白标签的 H3 标准格式。
+部分节点基于以下项目/方案修改：
+
+- [ComfyUI-H3-Multishot](https://github.com/jlucasmcrell/ComfyUI-H3-Multishot) —— `H3InfiniteHumanMV`（无限采样）改编自其链式多镜采样与接缝处理设计
+- 社区 Context 方案 —— `H3ClipChainAV` 的 Motion Context 无缝续帧沿用社区 context 思路
 
 ## 常见问题
 
