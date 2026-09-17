@@ -384,6 +384,13 @@ class H3InfiniteHumanMV(io.ComfyNode):
                     ),
                 ),
                 # ---- 节点内部 widget ----
+                io.String.Input(
+                    "segment_durations", optional=True, default="",
+                    tooltip=(
+                        "每镜时长列表（秒），逗号分隔，与 H3 Clip Chain 的 segment_durations 同款。"
+                        "如 \"10,5\" = 镜1=10秒，镜2=5秒。\n"
+                        "留空=每镜统一默认时长（接 AIO 时由 AIO latent 决定；独立模式 243 帧≈10s）。\n"
+                        "帧数自动对齐 H3 约束（length % 17 == 5）。")),
                 io.Int.Input(
                     "shot_count", default=0, min=0, max=10000,
                     tooltip="0 = 无限时长，直到按取消（推荐，配合逐镜落盘）。"
@@ -455,6 +462,7 @@ class H3InfiniteHumanMV(io.ComfyNode):
     @classmethod
     def execute(cls, model, clip, video_vae, audio_vae,
                 initial_cond=None, initial_latent=None, prompt_json=None,
+                segment_durations="",
                 shot_count=0, max_shots=1000, seed=0, steps=20,
                 sampler_name="euler", scheduler="simple",
                 handoff="latent", ref_anchor="first_shot", smart_trim=True,
@@ -489,6 +497,18 @@ class H3InfiniteHumanMV(io.ComfyNode):
                     break
         else:
             prompts = []
+
+        # ---- 每镜时长（逗号分隔秒数，与 H3 Clip Chain 的 segment_durations 同款）----
+        seg_durations = []
+        if segment_durations and str(segment_durations).strip():
+            for _part in str(segment_durations).split(","):
+                _part = _part.strip()
+                if _part:
+                    try:
+                        seg_durations.append(float(_part))
+                    except ValueError:
+                        pass
+
         chained = (initial_latent is not None) or (initial_cond is not None)
         if not prompts and initial_cond is None:
             raise ValueError("[H3InfiniteMV] prompt_json 为空且未接 initial_cond："
@@ -526,9 +546,11 @@ class H3InfiniteHumanMV(io.ComfyNode):
             # 独立模式：固定 768x1344x243（≈10s），无参数可配
             width, height, frames_per_shot = 768, 1344, 243
             latent_base, frame_count = mmh3._empty_av_latent(width, height, frames_per_shot)
-        print(f"[H3InfiniteMV] 每镜 {frame_count} 帧（{frame_count / 24.0:.1f}s）@ "
+        print(f"[H3InfiniteMV] 每镜默认 {frame_count} 帧（{frame_count / 24.0:.1f}s）@ "
               f"{width}x{height}；{'无限' if infinite else str(total)} 镜，"
-              f"{n_prompts} 组提示词循环", flush=True)
+              f"{n_prompts} 组提示词循环"
+              + (f"；segment_durations={seg_durations}" if seg_durations else ""),
+              flush=True)
 
         # ---- 复用 H3 Clip Chain (micxin) 的多段 clip 接续函数（不修改该节点）----
         h3cc = _load_h3cc()
@@ -566,6 +588,11 @@ class H3InfiniteHumanMV(io.ComfyNode):
                 if throw_exception_if_processing_interrupted is not None:
                     throw_exception_if_processing_interrupted()
 
+                # --- 本镜帧数：segment_durations 逗号分隔秒数，第 i 个 = 第 i 镜 ---
+                fc = frame_count
+                if i < len(seg_durations) and seg_durations[i] > 0:
+                    fc = h3cc._resolve_length(seg_durations[i])
+
                 # --- latent：每镜都从 AIO latent 模板随机创建 ---
                 # AIO latent 是 Ref2VA 参考图编码，直接用会把首帧锁成参考图变种
                 # （提示词无法跳切）；随机化 + minimax_refs 身份锚 = 参考生视频
@@ -574,9 +601,12 @@ class H3InfiniteHumanMV(io.ComfyNode):
                     trim_expected = (h3cc._motion_context_trim(prev_latent, _MC_CONTEXT)
                                      if prev_latent is not None else 0)
                     latent = h3cc._create_segment_latent(
-                        initial_latent, frame_count + trim_expected)
+                        initial_latent, fc + trim_expected)
                 else:
-                    latent = latent_base
+                    if fc == frame_count:
+                        latent = latent_base
+                    else:
+                        latent = h3cc._create_segment_latent(latent_base, fc)
 
                 # --- 条件：每镜都吃提示词（重编码继承 AIO 参考锚）---
                 if n_prompts == 0:
@@ -593,7 +623,7 @@ class H3InfiniteHumanMV(io.ComfyNode):
                             anchor_base = _strip_ref_anchor(initial_cond)
                         cond = h3cc._reencode_prompt_with_ref(
                             clip, _dialogue_safe(prompt, h3cc), anchor_base,
-                            segment_idx=i, frames_per_segment=frame_count,
+                            segment_idx=i, frames_per_segment=fc,
                             first_frame_has_image=(handoff == "vision"
                                                    and prev_last is not None))
                         _evict_te(clip, model)
@@ -648,7 +678,7 @@ class H3InfiniteHumanMV(io.ComfyNode):
                 # 音频靠解码后波形替换锁定；音频 guide 会干扰视频生成导致画面糊）
                 _skip_audio_guide = (audio_lock_mode != "off") or (audio_vae is None)
                 for kf in seg_keyframes:
-                    if int(kf.get("frame_idx", -1)) >= frame_count:
+                    if int(kf.get("frame_idx", -1)) >= fc:
                         continue
                     _img = kf.get("image")
                     _aud = None if _skip_audio_guide else kf.get("audio")
@@ -669,12 +699,12 @@ class H3InfiniteHumanMV(io.ComfyNode):
                     kf["latent"] = video_vae.encode(kf.pop("image"))
                     cond = node_helpers.conditioning_set_values(cond, {
                         "minimax_keyframes": [kf],
-                        "minimax_frame_count": frame_count,
+                        "minimax_frame_count": fc,
                     })
 
                 tag = (i % n_prompts + 1 if n_prompts else "AIO")
                 print(f"[H3InfiniteMV] 镜 {i + 1}/{total or '∞'} "
-                      f"({frame_count}f, 条件 {tag})", flush=True)
+                      f"({fc}f, 条件 {tag})", flush=True)
 
                 # --- 采样（H3 专用：comfy.sample.sample + prepare_noise，
                 #    正确对 AV NestedTensor latent 的视频/音频两部分加噪，
