@@ -6,7 +6,7 @@ H3 Prompt Fix - ComfyUI 自定义节点
 支持的问题：
 1. 输出没有大括号 { } —— 自动补全
 2. 没有严格按输入段数分段 —— 按镜X / 空行重新切分补齐
-3. 仍在使用 <d> 标签 —— 转换为自然语言内联对话
+3. 仍在使用 <d> 标签 —— 原样保留（H3 靠 <d> 识别对白并按台词朗读，转换会废掉口型）
 4. 六段之间用单 \n —— 统一为 \n\n
 5. 字段缺失 —— 用默认值补齐
 6. 混入 markdown 代码块 / 多余解释文字 —— 清洗
@@ -106,35 +106,11 @@ def _normalize_newlines(text: str) -> str:
     return text
 
 
-def _convert_dialogue_tags(text: str) -> str:
-    """把 <d>...</d> 标签转换为 H3 自然语言内联对话"""
-    def repl(m):
-        content = m.group(1).strip()
-        # 尝试提取 时间戳 + 说话人
-        ts = re.search(r"(\d{2}:\d{2}(?:\s*-\s*\d{2}:\d{2})?)", content)
-        speaker = re.search(r"\(([^)]+)\)\s*:\s*", content)
-        dialogue = re.sub(r"^[\d:]+\s*-\s*[\d:]+\s*", "", content).strip()
-        dialogue = re.sub(r"^\([^)]+\)\s*:\s*", "", dialogue).strip()
-        dialogue = dialogue.strip('"').strip()
-
-        parts = []
-        if speaker:
-            parts.append(f"{speaker.group(1).strip()} says")
-        if dialogue:
-            parts.append(f'"{dialogue}"')
-        if ts:
-            parts.append(f"from {ts.group(1).replace(' ', '')}")
-        return " ".join(parts) + ". " if parts else f'"{dialogue}". '
-    result = re.sub(r"<d>(.*?)</d>", repl, text, flags=re.DOTALL)
-    return result
-
-
 def _split_into_fields(body: str, seg_index: int) -> Dict[str, str]:
     """把一个片段的正文解析为六字段字典"""
     # 归一化换行（处理转义的 \n 与真实换行的混合情况）
     body = _normalize_newlines(body)
-    # 先转换 <d> 标签
-    body = _convert_dialogue_tags(body)
+    # <d>...</d> 对白块原样保留，不做任何转换（H3 靠 <d> 判定对白并朗读）
 
     fields = {}
     for f in FIELDS:
@@ -192,7 +168,7 @@ def fix_prompt(raw_text: str, expected_segments: int = 0) -> Tuple[str, str]:
     segments = parsed if isinstance(parsed, dict) else None
 
     if segments:
-        # 已有 JSON，做字段级修复（补全字段、转换 <d>、统一 \n\n）
+        # 已有 JSON，做字段级修复（补全字段、保留 <d>、统一 \n\n）
         max_key = -1
         for k in segments:
             try:
