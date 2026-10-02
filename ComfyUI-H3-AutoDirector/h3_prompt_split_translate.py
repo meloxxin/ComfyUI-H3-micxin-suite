@@ -57,28 +57,9 @@ _H3_SPLIT_META_FIELDS = {
 }
 
 
-# 处理上限：最多 9 段（9 宫格分镜九段一次跑，接 H3 Clip Chain）
-MAX_SEGMENTS = 9
-# 独立 prompt 输出端口数：0（不暴露 prompt_N 口，界面最简洁）。
-# 分镜统一走 segments_json 一根线 → H3 Segments Unpack (micxin) 拆成 9 个分镜口
-# → ClipChain 的 segment_prompts（Autogrow 逐口，节点逐镜感知分镜）。
-PROMPT_OUTPUTS = 0
-
-_TRANSLATE_SYS = """You are a professional translator for H3 video generation prompts (Chinese to English).
-Translate the Chinese description text into English. STRICT RULES:
-1. <d>...</d> dialogue blocks: KEEP the original text EXACTLY as-is. Never translate them.
-2. ANY quoted dialogue (e.g. S1 says: "你凭什么删我东西……", 她说："不要走") — the text inside quotes is DIALOGUE: keep it verbatim, never translate.
-3. Everything else (subject definitions, actions, camera moves, scene, emotions, soundscape, music descriptions): translate into English.
-4. Keep all field names unchanged: subject_definitions:, summary:, retention_analysis:, detailed_description:, overall_soundscape:, non_diegetic_music:.
-5. Keep the overall structure, field order and line breaks. Do not add or remove segments or fields.
-6. Reference images are attached: describe the subject/background so the translated prompt stays consistent with the reference images.
-7. Output ONLY the translated prompt text. No explanations, no notes, no code fences."""
-
-# 引号内中文对话 → 占位符（保护不翻译）
-_QUOTED_CN = re.compile(r'(["\u201c\u2018\u300c\u300e])([^"\u201d\u2019\u300d\u300f]{1,200}?)(["\u201d\u2019\u300d\u300f])', re.S)
-
-
-_D_BLOCK_RE = re.compile(r"<d>.*?</d>", re.S)
+def _dict_to_h3_prompt(fields_dict):
+    """把字段 dict 按 H3 标准顺序拼成纯文本提示词（对象数组元素用）。"""
+    ordered = []
 
 
 def _dict_to_h3_prompt(fields_dict):
@@ -102,13 +83,16 @@ def _dict_to_h3_prompt(fields_dict):
     return "\n\n".join(f"{name}: {value}" for name, value in ordered)
 
 
+
+
+
 def _split_to_prompt_list(raw):
     """把输入拆成提示词列表，支持四种来源：
 
       - Python list（上游直接传列表，如 H3PromptWriter 剧本模式的 shots 输出）
       - JSON 数组字符串（字符串数组 / 对象数组，对象优先取 "prompt" 字段）
       - 多行纯文本（每行一段；行首 "#" 保留为独立模式标记；"//" 注释跳过；
-        连续空行=段分隔，无空行时每行一段）
+）
       - 单条字符串（视为一段）
 
     返回 str 列表；空输入返回 []。
@@ -177,6 +161,32 @@ def _split_to_prompt_list(raw):
     return out
 
 
+
+
+# 处理上限：最多 9 段（9 宫格分镜九段一次跑，接 H3 Clip Chain）
+MAX_SEGMENTS = 9
+# 独立 prompt 输出端口数：0（不暴露 prompt_N 口，界面最简洁）。
+# 分镜统一走 segments_json 一根线 → H3 Segments Unpack (micxin) 拆成 9 个分镜口
+# → ClipChain 的 segment_prompts（Autogrow 逐口，节点逐镜感知分镜）。
+PROMPT_OUTPUTS = 0
+
+_TRANSLATE_SYS = """You are a professional translator for H3 video generation prompts (Chinese to English).
+Translate the Chinese description text into English. STRICT RULES:
+1. <d>...</d> dialogue blocks: KEEP the original text EXACTLY as-is. Never translate them.
+2. ANY quoted dialogue (e.g. S1 says: "你凭什么删我东西……", 她说："不要走") — the text inside quotes is DIALOGUE: keep it verbatim, never translate.
+3. Everything else (subject definitions, actions, camera moves, scene, emotions, soundscape, music descriptions): translate into English.
+4. Keep all field names unchanged: subject_definitions:, summary:, retention_analysis:, detailed_description:, overall_soundscape:, non_diegetic_music:.
+5. Keep the overall structure, field order and line breaks. Do not add or remove segments or fields.
+6. Reference images are attached: describe the subject/background so the translated prompt stays consistent with the reference images.
+7. Output ONLY the translated prompt text. No explanations, no notes, no code fences."""
+
+# 引号内中文对话 → 占位符（保护不翻译）
+_QUOTED_CN = re.compile(r'([""\u201c\u2018\u300c\u300e])([^""\u201d\u2019\u300d\u300f]{1,200}?)([""\u201d\u2019\u300d\u300f])', re.S)
+
+
+_D_BLOCK_RE = re.compile(r"<d>.*?</d>", re.S)
+
+
 def _protect_dialogues(text):
     """翻译/反推前：把台词换成占位符，返回 (masked, protected)。
 
@@ -213,7 +223,7 @@ def _restore_dialogues(text, protected):
 
 # 裸引号中文对话 → H3 <d> 块（带每段时间戳；<d> 块内部不动）
 _D_QUOTE_RE = re.compile(
-    r'(["\u201c\u2018])([^"\u201d\u2019]{1,300}?)(["\u201d\u2019])')
+    r'([""\u201c\u2018])([^""\u201d\u2019]{1,300}?)([""\u201d\u2019])')
 
 
 def _quotes_to_d_blocks(text, seg_seconds=5.0):
@@ -595,20 +605,20 @@ def _batch_rewrite_segments(segs, llm, temperature, seed, ref_contents=None,
         f"detailed_description. Each segment's detailed_description describes ONLY "
         f"that segment's own action and dialogue.\n"
         f"Each segment duration: {dur} seconds (H3 hard cap 15s).\n"
-        f"REFERENCE ROLE SPLIT: a reference image is NOT automatically a video first "
-        f"frame; when a character's look must come from a reference image, LOCK it in "
-        f"subject_definitions with an explicit sentence such as: \"The reference image "
-        f"<Picture N> defines her facial features, hair style, and body proportions.\" "
-        f"(adapt N to the actual tag number, e.g. <Picture 1>). Use <Picture N> as an "
-        f"independent reference ONLY when the input actually uses that tag.\n"
-        f"SUBJECT_DEFINITIONS IS REQUIRED AND MUST BE NON-EMPTY: for every character "
-        f"whose look is locked by a reference image, subject_definitions MUST contain "
-        f"that locking sentence. NEVER leave subject_definitions empty or 'N/A'.\n"
-        f"SUMMARY IS REQUIRED: write a real 1-2 sentence plot summary of the segment; "
-        f"NEVER output placeholders such as 'Segment N, auto-generated summary.'\n"
-        f"NO CHINESE LEAKAGE: translate ALL non-dialogue Chinese into English; NEVER "
-        f"leave raw Chinese words in the description — not even with parenthetical "
-        f"explanations like (屈辱 means ...).\n"
+f"REFERENCE ROLE SPLIT: a reference image is NOT automatically a video first "
+f"frame; when a character\'s look must come from a reference image, LOCK it in "
+f"subject_definitions with an explicit sentence such as: \"The reference image "
+f"<Picture N> defines her facial features, hair style, and body proportions.\" "
+f"(adapt N to the actual tag number, e.g. <Picture 1>). Use <Picture N> as an "
+f"independent reference ONLY when the input actually uses that tag.\n"
+f"SUBJECT_DEFINITIONS IS REQUIRED AND MUST BE NON-EMPTY: for every character "
+f"whose look is locked by a reference image, subject_definitions MUST contain "
+f"that locking sentence. NEVER leave subject_definitions empty or 'N/A'.\n"
+f"SUMMARY IS REQUIRED: write a real 1-2 sentence plot summary of the segment; "
+f"NEVER output placeholders such as 'Segment N, auto-generated summary.'\n"
+f"NO CHINESE LEAKAGE: translate ALL non-dialogue Chinese into English; NEVER "
+f"leave raw Chinese words in the description — not even with parenthetical "
+f"explanations like (屈辱 means ...).\n"
         f"VISUAL STYLE: {style}\n"
         f"ASPECT RATIO: {aspect_ratio}  (render canvas {w}x{h}, ~{resolution_mp} MP)\n"
         f"HARD SHOT BUDGET per segment (violating breaks the render pipeline): each "
@@ -734,6 +744,7 @@ def _rewrite_segment(seg_text, llm, temperature, seed, ref_contents=None,
     return _translate_segment(seg_text, llm, temperature, seed, ref_contents, max_tokens)
 
 
+
 def _generic_rewrite_segment(seg_text, llm, temperature, seed, ref_contents=None,
                              seg_seconds=5.0, aspect_ratio="16:9",
                              resolution_mp=1.0, max_tokens=4096):
@@ -767,20 +778,20 @@ def _generic_rewrite_segment(seg_text, llm, temperature, seed, ref_contents=None
         f"VISUAL STYLE: {style}\n"
         f"TOTAL DURATION: {dur} seconds (H3 hard cap 15s). "
         f"Plan the detailed_description timeline within this budget.\n"
-        f"REFERENCE ROLE SPLIT: a reference image is NOT automatically a video first "
-        f"frame; when a character's look must come from a reference image, LOCK it in "
-        f"subject_definitions with an explicit sentence such as: \"The reference image "
-        f"<Picture N> defines her facial features, hair style, and body proportions.\" "
-        f"(adapt N to the actual tag number, e.g. <Picture 1>). Use <Picture N> as an "
-        f"independent reference ONLY when the input actually uses that tag.\n"
-        f"SUBJECT_DEFINITIONS IS REQUIRED AND MUST BE NON-EMPTY: for every character "
-        f"whose look is locked by a reference image, subject_definitions MUST contain "
-        f"that locking sentence. NEVER leave subject_definitions empty or 'N/A'.\n"
-        f"SUMMARY IS REQUIRED: write a real 1-2 sentence plot summary of the segment; "
-        f"NEVER output placeholders such as 'Segment N, auto-generated summary.'\n"
-        f"NO CHINESE LEAKAGE: translate ALL non-dialogue Chinese into English; NEVER "
-        f"leave raw Chinese words in the description — not even with parenthetical "
-        f"explanations like (屈辱 means ...).\n"
+f"REFERENCE ROLE SPLIT: a reference image is NOT automatically a video first "
+f"frame; when a character\'s look must come from a reference image, LOCK it in "
+f"subject_definitions with an explicit sentence such as: \"The reference image "
+f"<Picture N> defines her facial features, hair style, and body proportions.\" "
+f"(adapt N to the actual tag number, e.g. <Picture 1>). Use <Picture N> as an "
+f"independent reference ONLY when the input actually uses that tag.\n"
+f"SUBJECT_DEFINITIONS IS REQUIRED AND MUST BE NON-EMPTY: for every character "
+f"whose look is locked by a reference image, subject_definitions MUST contain "
+f"that locking sentence. NEVER leave subject_definitions empty or 'N/A'.\n"
+f"SUMMARY IS REQUIRED: write a real 1-2 sentence plot summary of the segment; "
+f"NEVER output placeholders such as 'Segment N, auto-generated summary.'\n"
+f"NO CHINESE LEAKAGE: translate ALL non-dialogue Chinese into English; NEVER "
+f"leave raw Chinese words in the description — not even with parenthetical "
+f"explanations like (屈辱 means ...).\n"
         f"ASPECT RATIO: {aspect_ratio}  (render canvas {w}x{h}, ~{resolution_mp} MP)\n"
         f"HARD SHOT BUDGET (violating breaks the render pipeline): the "
         f"detailed_description may contain at most {shot_cap} [Shot N] beat markers "
