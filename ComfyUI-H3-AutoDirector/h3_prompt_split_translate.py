@@ -23,7 +23,8 @@ import re
 
 from comfy_api.latest import io
 
-from .h3_screenwriter import (
+from .h3_llm_utils import (
+    _call_llm,
     _load_local_llm,
     _call_local_llm,
     _unload_local,
@@ -56,9 +57,28 @@ _H3_SPLIT_META_FIELDS = {
 }
 
 
-def _dict_to_h3_prompt(fields_dict):
-    """把字段 dict 按 H3 标准顺序拼成纯文本提示词（对象数组元素用）。"""
-    ordered = []
+# 处理上限：最多 9 段（9 宫格分镜九段一次跑，接 H3 Clip Chain）
+MAX_SEGMENTS = 9
+# 独立 prompt 输出端口数：0（不暴露 prompt_N 口，界面最简洁）。
+# 分镜统一走 segments_json 一根线 → H3 Segments Unpack (micxin) 拆成 9 个分镜口
+# → ClipChain 的 segment_prompts（Autogrow 逐口，节点逐镜感知分镜）。
+PROMPT_OUTPUTS = 0
+
+_TRANSLATE_SYS = """You are a professional translator for H3 video generation prompts (Chinese to English).
+Translate the Chinese description text into English. STRICT RULES:
+1. <d>...</d> dialogue blocks: KEEP the original text EXACTLY as-is. Never translate them.
+2. ANY quoted dialogue (e.g. S1 says: "你凭什么删我东西……", 她说："不要走") — the text inside quotes is DIALOGUE: keep it verbatim, never translate.
+3. Everything else (subject definitions, actions, camera moves, scene, emotions, soundscape, music descriptions): translate into English.
+4. Keep all field names unchanged: subject_definitions:, summary:, retention_analysis:, detailed_description:, overall_soundscape:, non_diegetic_music:.
+5. Keep the overall structure, field order and line breaks. Do not add or remove segments or fields.
+6. Reference images are attached: describe the subject/background so the translated prompt stays consistent with the reference images.
+7. Output ONLY the translated prompt text. No explanations, no notes, no code fences."""
+
+# 引号内中文对话 → 占位符（保护不翻译）
+_QUOTED_CN = re.compile(r'(["\u201c\u2018\u300c\u300e])([^"\u201d\u2019\u300d\u300f]{1,200}?)(["\u201d\u2019\u300d\u300f])', re.S)
+
+
+_D_BLOCK_RE = re.compile(r"<d>.*?</d>", re.S)
 
 
 def _dict_to_h3_prompt(fields_dict):
@@ -82,16 +102,13 @@ def _dict_to_h3_prompt(fields_dict):
     return "\n\n".join(f"{name}: {value}" for name, value in ordered)
 
 
-
-
-
 def _split_to_prompt_list(raw):
     """把输入拆成提示词列表，支持四种来源：
 
       - Python list（上游直接传列表，如 H3PromptWriter 剧本模式的 shots 输出）
       - JSON 数组字符串（字符串数组 / 对象数组，对象优先取 "prompt" 字段）
       - 多行纯文本（每行一段；行首 "#" 保留为独立模式标记；"//" 注释跳过；
-）
+        连续空行=段分隔，无空行时每行一段）
       - 单条字符串（视为一段）
 
     返回 str 列表；空输入返回 []。
@@ -160,27 +177,6 @@ def _split_to_prompt_list(raw):
     return out
 
 
-
-
-MAX_SEGMENTS = 4
-
-_TRANSLATE_SYS = """You are a professional translator for H3 video generation prompts (Chinese to English).
-Translate the Chinese description text into English. STRICT RULES:
-1. <d>...</d> dialogue blocks: KEEP the original text EXACTLY as-is. Never translate them.
-2. ANY quoted dialogue (e.g. S1 says: "你凭什么删我东西……", 她说："不要走") — the text inside quotes is DIALOGUE: keep it verbatim, never translate.
-3. Everything else (subject definitions, actions, camera moves, scene, emotions, soundscape, music descriptions): translate into English.
-4. Keep all field names unchanged: subject_definitions:, summary:, retention_analysis:, detailed_description:, overall_soundscape:, non_diegetic_music:.
-5. Keep the overall structure, field order and line breaks. Do not add or remove segments or fields.
-6. Reference images are attached: describe the subject/background so the translated prompt stays consistent with the reference images.
-7. Output ONLY the translated prompt text. No explanations, no notes, no code fences."""
-
-# 引号内中文对话 → 占位符（保护不翻译）
-_QUOTED_CN = re.compile(r'([""\u201c\u2018\u300c\u300e])([^""\u201d\u2019\u300d\u300f]{1,200}?)([""\u201d\u2019\u300d\u300f])', re.S)
-
-
-_D_BLOCK_RE = re.compile(r"<d>.*?</d>", re.S)
-
-
 def _protect_dialogues(text):
     """翻译/反推前：把台词换成占位符，返回 (masked, protected)。
 
@@ -217,7 +213,7 @@ def _restore_dialogues(text, protected):
 
 # 裸引号中文对话 → H3 <d> 块（带每段时间戳；<d> 块内部不动）
 _D_QUOTE_RE = re.compile(
-    r'([""\u201c\u2018])([^""\u201d\u2019]{1,300}?)([""\u201d\u2019])')
+    r'(["\u201c\u2018])([^"\u201d\u2019]{1,300}?)(["\u201d\u2019])')
 
 
 def _quotes_to_d_blocks(text, seg_seconds=5.0):
@@ -334,6 +330,44 @@ def _fix_dialect_tags(text, src_text):
     return _DIALECT_PLAIN_RE.sub(repl_plain, text)
 
 
+def _llm_generate(llm, messages, temperature, seed, max_tokens):
+    """统一 LLM 调用出口：llm 为 llama-cpp Llama 实例 → 本地 GGUF；
+    llm 为 HTTP 调用器（_make_http_llm_caller 构造、带 _h3_http_caller 标记）
+    → 调 OpenAI 兼容 /v1/chat/completions 端点。
+
+    注意：不能用 callable(llm) 判断——llama_cpp 的 Llama 实例也实现了
+    __call__，会被误判成 HTTP 调用器，导致 messages 被当成 prompt 传入
+    create_completion，触发内部 assert 崩溃（用户日志里的 AssertionError 即此）。
+    改用显式标记区分。"""
+    if getattr(llm, "_h3_http_caller", False):
+        return llm(messages, max_tokens)
+    return _call_local_llm(llm, messages, temperature, seed, max_tokens)
+
+
+def _make_http_llm_caller(llm_base_url, model, api_key, temperature, seed):
+    """构造 HTTP(OpenAI 兼容 /v1/chat/completions) 调用器，复用 H3PromptWriter
+    的 _call_llm 实现（Bearer api_key、重试、thinking 关闭、总超时护栏同款）。
+    返回 callable(messages, max_tokens) -> str。"""
+    url = (llm_base_url or "").strip()
+    mdl = (model or "").strip()
+    key = (api_key or "").strip()
+    if not url:
+        raise ValueError(
+            "H3PromptSplitTranslate: llm_base_url 为空（backend=HTTP 模式）。"
+            "请填 OpenAI 兼容端点，如 https://api.deepseek.com/v1/chat/completions "
+            "或本地 llama.cpp server 的 http://127.0.0.1:8080/v1/chat/completions")
+    if not mdl:
+        raise ValueError(
+            "H3PromptSplitTranslate: model 为空（backend=HTTP 模式）。"
+            "请填模型名（如 deepseek-v3 / qwen2.5:14b / GGUF basename）。")
+
+    def call(messages, max_tokens=4096):
+        return _call_llm(url, mdl, key, messages, temperature, seed)
+
+    call._h3_http_caller = True  # 显式标记：供 _llm_generate 区分 HTTP 调用器与本地 Llama 实例
+    return call
+
+
 def _translate_leftover_cn(text, llm, temperature, seed, ref_contents=None, max_tokens=2048):
     """反推输出兜底：把 <d> 块与引号之外残留的中文翻译成英文（编号批量翻译）。
 
@@ -363,7 +397,7 @@ def _translate_leftover_cn(text, llm, temperature, seed, ref_contents=None, max_
               "Output ONLY the numbered translations, one per line, e.g. '1. ...' "
               "— no explanations, no extra text.")
     try:
-        out = _call_local_llm(
+        out = _llm_generate(
             llm,
             [{"role": "system", "content": sys_cn},
              {"role": "user", "content": numbered}],
@@ -404,12 +438,18 @@ def _translate_segment(seg_text, llm, temperature, seed, ref_contents=None, max_
             {"role": "user", "content": masked},
         ]
     try:
-        out = _call_local_llm(llm, messages, temperature, seed, max_tokens)
+        out = _llm_generate(llm, messages, temperature, seed, max_tokens)
         out = (out or "").strip()
         if out:
             return _ensure_subject_defs(_restore_dialogues(out, protected))
     except Exception as e:
-        print(f"[H3PromptSplitTranslate] 翻译失败({type(e).__name__}: {e})，保留原文", flush=True)
+        # 2026-10-02：不再静默返回原文（曾导致用户只看到"没翻译"、看不到原因）。
+        # 直接抛出让节点红框显示真实原因，便于修正 backend/模型/api_key 配置。
+        raise RuntimeError(
+            f"[H3PromptSplitTranslate] LLM 翻译失败：{type(e).__name__}: {e}。\n"
+            f"请检查：① backend=Local GGUF 时 gguf_name 是否选了模型；"
+            f"② backend=HTTP 时 llm_base_url/model/api_key 是否填对；"
+            f"③ bypass_llm 是否误开。") from e
     return seg_text
 
 
@@ -555,20 +595,20 @@ def _batch_rewrite_segments(segs, llm, temperature, seed, ref_contents=None,
         f"detailed_description. Each segment's detailed_description describes ONLY "
         f"that segment's own action and dialogue.\n"
         f"Each segment duration: {dur} seconds (H3 hard cap 15s).\n"
-f"REFERENCE ROLE SPLIT: a reference image is NOT automatically a video first "
-f"frame; when a character\'s look must come from a reference image, LOCK it in "
-f"subject_definitions with an explicit sentence such as: \"The reference image "
-f"<Picture N> defines her facial features, hair style, and body proportions.\" "
-f"(adapt N to the actual tag number, e.g. <Picture 1>). Use <Picture N> as an "
-f"independent reference ONLY when the input actually uses that tag.\n"
-f"SUBJECT_DEFINITIONS IS REQUIRED AND MUST BE NON-EMPTY: for every character "
-f"whose look is locked by a reference image, subject_definitions MUST contain "
-f"that locking sentence. NEVER leave subject_definitions empty or 'N/A'.\n"
-f"SUMMARY IS REQUIRED: write a real 1-2 sentence plot summary of the segment; "
-f"NEVER output placeholders such as 'Segment N, auto-generated summary.'\n"
-f"NO CHINESE LEAKAGE: translate ALL non-dialogue Chinese into English; NEVER "
-f"leave raw Chinese words in the description \u2014 not even with parenthetical "
-f"explanations like (\u5c48\u8fb1 means ...).\n"
+        f"REFERENCE ROLE SPLIT: a reference image is NOT automatically a video first "
+        f"frame; when a character's look must come from a reference image, LOCK it in "
+        f"subject_definitions with an explicit sentence such as: \"The reference image "
+        f"<Picture N> defines her facial features, hair style, and body proportions.\" "
+        f"(adapt N to the actual tag number, e.g. <Picture 1>). Use <Picture N> as an "
+        f"independent reference ONLY when the input actually uses that tag.\n"
+        f"SUBJECT_DEFINITIONS IS REQUIRED AND MUST BE NON-EMPTY: for every character "
+        f"whose look is locked by a reference image, subject_definitions MUST contain "
+        f"that locking sentence. NEVER leave subject_definitions empty or 'N/A'.\n"
+        f"SUMMARY IS REQUIRED: write a real 1-2 sentence plot summary of the segment; "
+        f"NEVER output placeholders such as 'Segment N, auto-generated summary.'\n"
+        f"NO CHINESE LEAKAGE: translate ALL non-dialogue Chinese into English; NEVER "
+        f"leave raw Chinese words in the description — not even with parenthetical "
+        f"explanations like (屈辱 means ...).\n"
         f"VISUAL STYLE: {style}\n"
         f"ASPECT RATIO: {aspect_ratio}  (render canvas {w}x{h}, ~{resolution_mp} MP)\n"
         f"HARD SHOT BUDGET per segment (violating breaks the render pipeline): each "
@@ -591,7 +631,7 @@ f"explanations like (\u5c48\u8fb1 means ...).\n"
             {"role": "user", "content": user_brief},
         ]
     try:
-        out = _call_local_llm(llm, messages, temperature, seed, max_tokens)
+        out = _llm_generate(llm, messages, temperature, seed, max_tokens)
         out = (out or "").strip()
     except Exception as e:
         print(f"[H3PromptSplitTranslate] 整批反推失败({type(e).__name__}: {e})，"
@@ -676,7 +716,7 @@ def _rewrite_segment(seg_text, llm, temperature, seed, ref_contents=None,
             {"role": "user", "content": user_brief},
         ]
     try:
-        out = _call_local_llm(llm, messages, temperature, seed, max_tokens)
+        out = _llm_generate(llm, messages, temperature, seed, max_tokens)
         out = (out or "").strip()
         if out and _six_section_ok(out):
             out = _force_restore_dialogues(out, protected, seg_text)
@@ -692,7 +732,6 @@ def _rewrite_segment(seg_text, llm, temperature, seed, ref_contents=None,
               f"降级忠实翻译", flush=True)
         return _translate_segment(seg_text, llm, temperature, seed, ref_contents, max_tokens)
     return _translate_segment(seg_text, llm, temperature, seed, ref_contents, max_tokens)
-
 
 
 def _generic_rewrite_segment(seg_text, llm, temperature, seed, ref_contents=None,
@@ -728,20 +767,20 @@ def _generic_rewrite_segment(seg_text, llm, temperature, seed, ref_contents=None
         f"VISUAL STYLE: {style}\n"
         f"TOTAL DURATION: {dur} seconds (H3 hard cap 15s). "
         f"Plan the detailed_description timeline within this budget.\n"
-f"REFERENCE ROLE SPLIT: a reference image is NOT automatically a video first "
-f"frame; when a character\'s look must come from a reference image, LOCK it in "
-f"subject_definitions with an explicit sentence such as: \"The reference image "
-f"<Picture N> defines her facial features, hair style, and body proportions.\" "
-f"(adapt N to the actual tag number, e.g. <Picture 1>). Use <Picture N> as an "
-f"independent reference ONLY when the input actually uses that tag.\n"
-f"SUBJECT_DEFINITIONS IS REQUIRED AND MUST BE NON-EMPTY: for every character "
-f"whose look is locked by a reference image, subject_definitions MUST contain "
-f"that locking sentence. NEVER leave subject_definitions empty or 'N/A'.\n"
-f"SUMMARY IS REQUIRED: write a real 1-2 sentence plot summary of the segment; "
-f"NEVER output placeholders such as 'Segment N, auto-generated summary.'\n"
-f"NO CHINESE LEAKAGE: translate ALL non-dialogue Chinese into English; NEVER "
-f"leave raw Chinese words in the description \u2014 not even with parenthetical "
-f"explanations like (\u5c48\u8fb1 means ...).\n"
+        f"REFERENCE ROLE SPLIT: a reference image is NOT automatically a video first "
+        f"frame; when a character's look must come from a reference image, LOCK it in "
+        f"subject_definitions with an explicit sentence such as: \"The reference image "
+        f"<Picture N> defines her facial features, hair style, and body proportions.\" "
+        f"(adapt N to the actual tag number, e.g. <Picture 1>). Use <Picture N> as an "
+        f"independent reference ONLY when the input actually uses that tag.\n"
+        f"SUBJECT_DEFINITIONS IS REQUIRED AND MUST BE NON-EMPTY: for every character "
+        f"whose look is locked by a reference image, subject_definitions MUST contain "
+        f"that locking sentence. NEVER leave subject_definitions empty or 'N/A'.\n"
+        f"SUMMARY IS REQUIRED: write a real 1-2 sentence plot summary of the segment; "
+        f"NEVER output placeholders such as 'Segment N, auto-generated summary.'\n"
+        f"NO CHINESE LEAKAGE: translate ALL non-dialogue Chinese into English; NEVER "
+        f"leave raw Chinese words in the description — not even with parenthetical "
+        f"explanations like (屈辱 means ...).\n"
         f"ASPECT RATIO: {aspect_ratio}  (render canvas {w}x{h}, ~{resolution_mp} MP)\n"
         f"HARD SHOT BUDGET (violating breaks the render pipeline): the "
         f"detailed_description may contain at most {shot_cap} [Shot N] beat markers "
@@ -768,7 +807,7 @@ f"explanations like (\u5c48\u8fb1 means ...).\n"
             {"role": "user", "content": user_brief},
         ]
     try:
-        out = _call_local_llm(llm, messages, temperature, seed, max_tokens)
+        out = _llm_generate(llm, messages, temperature, seed, max_tokens)
         out = (out or "").strip()
         if out:
             out = _force_restore_dialogues(out, protected, seg_text)
@@ -834,7 +873,7 @@ def _resolve_length(duration_seconds):
 
 
 class H3PromptSplitTranslate(io.ComfyNode):
-    """拆分（≤4 段）+ 翻译（对话保留）+ 参考图过图 + 宽高长输出。"""
+    """拆分（≤9 段）+ 翻译（对话保留）+ 参考图过图 + 宽高长输出。"""
     # OUTPUT_NODE：让输出进入前端 executed 事件 / history，
     # 供 h3_prompt_split_report.js 内嵌 report 显示（不落盘、不影响下游）。
     OUTPUT_NODE = True
@@ -848,9 +887,11 @@ class H3PromptSplitTranslate(io.ComfyNode):
             display_name="H3 Prompt Split+Translate (micxin)",
             category="H3 helper/micxin",
             description=(
-                "修复+拆分+翻译一体：raw_text 原始提示词 → 内部修复为六段式 JSON（fixed_json "
-                "预览）→ 拆成最多 4 段，每段把非对话中文翻译成英文，<d> 标签和引号内对话保留"
-                "原文。prompt_0..3 直接接 H3 Clip Chain (micxin) 的 segment_prompts。\n"
+                "修复+拆分+翻译一体：raw_text 原始提示词 → 内部修复为六段式 JSON → "
+                "拆成最多 9 段，每段把非对话中文翻译成英文，<d> 标签和引号内对话保留"
+                "原文。分镜统一走 segments_json 一根线输出（≤9 段 JSON 字符串数组），"
+                "接 H3 Segments Unpack (micxin) 拆成 9 个分镜口，再接 ClipChain 的 "
+                "segment_prompts（界面最简洁）。\n"
                 "参考图过图：自动同步 H3 R2VA AIO(micxin) 的图片路径，本地 Qwen3-VL 看图"
                 "翻译，模型知道参考图内容（不是盲写文生）。\n"
                 "宽高长输出：aspect_ratio/resolution_mp/duration_seconds → width/height/length，"
@@ -896,10 +937,13 @@ class H3PromptSplitTranslate(io.ComfyNode):
                                         "（如 1.0=1376x768）；9:16/1:1/21:9/4:3 按该档 MP"
                                         "公式 32 对齐换算。")),
                 io.Float.Input("duration_seconds", default=5.0, min=1.0, max=60.0, step=0.5,
-                               tooltip="每段时长（秒）。输出 length 自动对齐 H3 帧约束（length % 17 == 5）。"),
+                               tooltip="每段时长（秒）。输出 length 自动对齐 H3 帧约束（length % 17 == 5）。"
+                                       "接 H3 Clip Chain 时，每段按此秒数采样，总时长 = 段数 × 每段秒数。"),
                 # ---- LLM 参数 ----
                 io.Combo.Input("backend", options=["Local GGUF", "HTTP"], default="Local GGUF",
-                               tooltip="只用本地 GGUF（默认）。HTTP 仅当你自己起了 llama.cpp server 时才切。"),
+                               tooltip="Local GGUF=ComfyUI 内直接加载模型（默认）。HTTP=调 OpenAI 兼容端点"
+                                       "（llama.cpp server / Ollama / SiliconFlow / OpenAI / DeepSeek…），"
+                                       "填下方 llm_base_url + model + api_key。"),
                 io.Combo.Input("gguf_name", options=ggufs,
                                default="",
                                tooltip="本地 GGUF 模型（ComfyUI/models/LLM 下）。过图需带 mmproj 的 VLM（如 Qwen3-VL）。"),
@@ -919,8 +963,13 @@ class H3PromptSplitTranslate(io.ComfyNode):
                                           "修复后的原始段文本。第二次重跑（只想再出视频）时打开，"
                                           "省显存省时间。")),
                 io.String.Input("llm_base_url", default="http://127.0.0.1:8080/v1/chat/completions",
-                                tooltip="backend=HTTP 时使用。"),
-                io.String.Input("model", default="", tooltip="backend=HTTP 时的模型名。"),
+                                tooltip="backend=HTTP 时使用。OpenAI 兼容端点"
+                                        "（llama.cpp server / Ollama / SiliconFlow / OpenAI / DeepSeek…）。"),
+                io.String.Input("model", default="", tooltip="backend=HTTP 时的模型名。"
+                                                             "（如 deepseek-v3 / qwen2.5:14b / GGUF basename）"),
+                io.String.Input("api_key", default="",
+                                tooltip="backend=HTTP 时的 API Key（Bearer token）。本地 llama.cpp server 可留空，"
+                                        "云端（DeepSeek/SiliconFlow/OpenAI 等）必填。"),
                 io.Combo.Input(
                     "rewrite_mode",
                     options=["忠实翻译", "H3 通用全参考模版", "fullreference"],
@@ -940,12 +989,20 @@ class H3PromptSplitTranslate(io.ComfyNode):
             ],
             outputs=[
                 io.String.Output(id=f"prompt_{i}", display_name=f"prompt_{i}")
-                for i in range(MAX_SEGMENTS)
+                for i in range(PROMPT_OUTPUTS)
             ] + [
+                io.String.Output(
+                    id="segments_json",
+                    display_name="segments_json",
+                    tooltip=(
+                        "翻译后的全量段 JSON 字符串数组（每段=完整六段式文本），"
+                        "接 H3 Clip Chain (micxin) 的 segments_json 接口（备用；"
+                        "日常用 prompt_0..8 逐口接 segment_prompts）。"
+                    ),
+                ),
                 io.Int.Output(id="width", display_name="width"),
                 io.Int.Output(id="height", display_name="height"),
                 io.Int.Output(id="length", display_name="length"),
-                io.String.Output(id="fixed_json", display_name="fixed_json"),
                 io.String.Output(id="report", display_name="report"),
             ],
         )
@@ -999,6 +1056,11 @@ class H3PromptSplitTranslate(io.ComfyNode):
         llm = None
         if backend == "Local GGUF" and not bypass:
             llm = _load_local_llm(gguf_name, mmproj_name, n_gpu_layers, context_size)
+        elif not bypass:
+            # backend=HTTP：构造 OpenAI 兼容调用器（闭包持有 url/model/api_key）
+            llm = _make_http_llm_caller(
+                kwargs.get("llm_base_url", ""), kwargs.get("model", ""),
+                kwargs.get("api_key", ""), temperature, seed)
 
         rewrite_mode = kwargs.get("rewrite_mode", "忠实翻译") or "忠实翻译"
         # 兼容旧工作流值：『六段式反推』→ fullreference（旧命名）；通用全参考模版保留原值走整批反推
@@ -1008,6 +1070,9 @@ class H3PromptSplitTranslate(io.ComfyNode):
             rewrite_mode = "H3 通用全参考模版"
         aspect_ratio = kwargs.get("aspect_ratio", "16:9") or "16:9"
         duration_seconds = float(kwargs.get("duration_seconds", 5.0) or 5.0)
+        # seg_seconds 只用于 LLM 提示词预算（每段时长/镜头数上限），不控制渲染时长；
+        # 渲染由 H3 Clip Chain (AV) 的 segment_durations 接管（segment_durations > clip duration > latent）。
+        # 九宫格一格一动作用法下，除法 + 2s 下限 = 每段 ≤1 个镜头，贴合分镜，保持原行为。
         seg_seconds = duration_seconds / max(1, len(segs))
         outputs = {}
         report = []
@@ -1059,14 +1124,20 @@ class H3PromptSplitTranslate(io.ComfyNode):
             aspect_ratio, kwargs.get("resolution_mp", _DEFAULT_RES_OPTION))
         length = _resolve_length(duration_seconds)
 
-        result = [outputs.get(f"prompt_{i}", "") for i in range(MAX_SEGMENTS)]
+        result = [outputs.get(f"prompt_{i}", "") for i in range(PROMPT_OUTPUTS)]
+        segments_json = json.dumps(
+            [outputs.get(f"prompt_{i}", "") for i in range(MAX_SEGMENTS)
+             if (outputs.get(f"prompt_{i}", "") or "").strip()],
+            ensure_ascii=False)
+        result.append(segments_json)
         result.append(w)
         result.append(h)
         result.append(length)
-        result.append(preview_json)  # fixed_json：修复后的六段式 JSON 预览
         report_text = "\n".join(report)  # report 放最后
         result.append(report_text)
-        print(f"[H3PromptSplitTranslate] 完成 {len(segs)} 段拆分+翻译 | {w}x{h} len={length}",
+        n_seg_json = len(json.loads(segments_json)) if segments_json else 0
+        print(f"[H3PromptSplitTranslate] 完成 {len(segs)} 段拆分+翻译 | "
+              f"segments_json={n_seg_json} 段 | {w}x{h} len={length}",
               flush=True)
         # ui 包装：report 随 executed 事件下发，V3 前端在节点底部显示文本
         # （与 ShowText 的 {"text": (…,)} 结构一致；不落盘、不影响下游数据流）
