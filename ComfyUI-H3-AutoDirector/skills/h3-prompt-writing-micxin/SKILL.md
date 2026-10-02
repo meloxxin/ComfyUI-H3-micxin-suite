@@ -80,7 +80,7 @@ length = frames + (5 - (frames % 17)) % 17           # H3 约束：length % 17 =
 
 - 叙事用英文；对话/歌词/画面文字在 `<d>[Language]…</d>` 内**逐字保留原语言**（粤语 `[Cantonese]`、普通话 `[Chinese]`、日文 `[Japanese]`、韩文 `[Korean]`、其他用 ISO/英文名，粤语等用原汉字，绝不翻译或罗马化）。
 - 风格前缀写在 `[Shot 1]` 开头：`Cinematic / live-action / 2D-animated / 3D CG / claymation / watercolor / vintage film`，或风格专属前缀。
-- 镜头时间戳：`[Shot 1]` 无时间戳；后续 `[Shot N] At MM:SS.mmm,` 递增且落在时长内。
+- 镜头时间戳：**可选**。`[Shot 1]` 无时间戳；后续若写 `[Shot N] At MM:SS.mmm,`，时间戳必须递增且**覆盖完整总时长**——最后一镜的时间戳要接近片尾（如 10s 视频末镜起始 ≥7s、动作延续到 10s），绝不能让时间线提前结束（10s 视频只写到 3-4s 是错误）；拿不准就不写时间戳，镜头按顺序自然铺满全片。
 - 摄像机运动三维：类型 + 幅度(`with small/large amplitude`) + 速度(`at slow/normal/fast speed`)，写成自然英文动作。
 - 说话人稳定 ID `(S1)`/`(S2)`；对话 `<Subject N> (Sx) says: <d>[Language] …</d>`；画外音加 `lips remain completely closed`；屏上文字双引号原样保留。
 - `overall_soundscape` 1–4 句英文、不重复对话与歌声；`non_diegetic_music` 1–3 句、只写乐器/速度/节奏/动态、无抽象情绪词；无则 N/A。

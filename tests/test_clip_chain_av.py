@@ -61,12 +61,13 @@ def test_merge_audio_handles_missing():
     assert CAV._merge_audio([None]) is None
 
 
-# ---------------- V3 节点 schema（19-widget 兼容） ----------------
+# ---------------- V3 节点 schema（segments_json 单线兼容） ----------------
 
 @requires_comfy
 def test_clip_chain_av_schema_19_widgets_compatible():
-    """schema widget 顺序 = 旧版 18 固定 widget（+1 Autogrow 空槽 = 19 项），
-    与用户主工作流（四视图+R2VA Sparse Attention）的 widgets_values 对齐。"""
+    """schema widget 顺序 = 旧版固定 widget（+1 Autogrow 空槽 + segments_json 单线）。
+    2026-10-02 在 segment_prompts 之后插入 segments_json（Split+Translate 九段单线），
+    旧工作流槽位错位由 web/h3_clip_chain_av.js 按 widgets_values_named 迁移修复。"""
     schema = CAV.H3ClipChainAV.define_schema()
 
     names = []
@@ -78,7 +79,7 @@ def test_clip_chain_av_schema_19_widgets_compatible():
     fixed = [n for n in names if not n.startswith("prompt_")]
 
     expected = [
-        "prompts", "segment_prompts",
+        "prompts", "segment_prompts", "segments_json",
         "seeds", "base_seed", "context_length", "audio_context_length",
         "steps", "sampler_name", "scheduler", "denoise",
         "keyframe_paths", "segment_durations", "audio_lock_mode",
@@ -86,12 +87,12 @@ def test_clip_chain_av_schema_19_widgets_compatible():
         "auto_first_frame",
         "no_subtitles",
     ]
-    # 去掉 Autogrow 的 segment_prompts 后，固定 widget 数 = 16
+    # 去掉 Autogrow 的 segment_prompts 后，固定 widget 数 = 17
     # （noise_mask / blend_grain / noise_mask_invert 已删除；
     #  start_segment / preview_segments 保留功能但 hidden 不在面板显示）
     fixed_no_auto = [n for n in fixed if n != "segment_prompts"]
     assert fixed_no_auto == expected[:1] + expected[2:]
-    assert len(fixed_no_auto) == 16
+    assert len(fixed_no_auto) == 17
     # 回退：不再有 TaperNoise / 流式落盘相关参数
     assert "context_noise" not in fixed
     assert "match_tail" not in fixed
