@@ -175,9 +175,10 @@ function applyBackendVisibility(node) {
     if (adv && adv.value !== true) return;  // 高级组收起 → HTTP 三件已折叠, 不动
     const backend = getWidget(node, "backend");
     if (!backend) return;
-    const wantVisible = isInfinite(node)
-        ? (backend.value === "HTTP")
-        : (backend.value === "HTTP endpoint");
+    const wantVisible = (backend.value === "HTTP" || backend.value === "HTTP endpoint");
+    // 注意：H3PromptWriter 用 "HTTP endpoint"；H3 Prompt Split+Translate / H3InfiniteStoryWriter 用 "HTTP"。
+    // 2026-10-02 修复：此前只认 "HTTP endpoint"，Split+Translate 切 HTTP 后 llm_base_url/model/api_key
+    // 永远被折叠隐藏，用户看不到 api_key 字段。
     const toggles = ["llm_base_url", "model", "api_key"];
     for (const nm of toggles) {
         const w = getWidget(node, nm);
