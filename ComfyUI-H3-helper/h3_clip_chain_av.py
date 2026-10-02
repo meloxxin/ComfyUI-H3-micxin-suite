@@ -1246,12 +1246,25 @@ class H3ClipChainAV(io.ComfyNode):
                         max=H3CC_MAX_SEGMENT_PROMPTS,
                     ),
                 ),
+                # ---- 九段单线：来自 H3 Prompt Split+Translate (micxin) 的 segments_json ----
+                io.String.Input(
+                    "segments_json",
+                    optional=True,
+                    force_input=True,
+                    default="",
+                    tooltip=(
+                        "多段 JSON 字符串数组（每段=完整六段式文本），直接接 "
+                        "H3 Prompt Split+Translate (micxin) 的 segments_json 输出，"
+                        "一次跑最多 9 段。\n"
+                        "提供本输入时优先于 prompts 文本框（低于 segment_prompts）。"
+                    ),
+                ),
                 # ---- 节点内部 widget ----
-                io.String.Input("seeds", optional=True, default="",
+                io.String.Input("seeds", optional=True, default="0", multiline=False,
                                 tooltip="每段的随机种子，逗号分隔（如 123,456,789）。留空则自动从 base_seed 递增。"),
                 io.Int.Input("base_seed", optional=True, default=0, min=0, max=0xffffffffffffffff,
                              tooltip="基础随机种子。seeds 留空时，每段在此基础上递增（段1=base_seed, 段2=base_seed+1...）。"),
-                io.Combo.Input("context_length", optional=True, options=["0", "5", "22", "39", "56"], default="22",
+                io.Combo.Input("context_length", optional=True, options=["0", "5", "22", "39", "56"], default="0",
                                tooltip=("链式接续时，从前一段注入多少帧作为 Motion Context（运动上下文）。\n"
                                         "0=不注入 latent 上下文（无拼接颗粒带；画面延续靠 auto_first_frame"
                                         " 首帧强条件，建议两者同开）。\n"
@@ -1329,6 +1342,7 @@ class H3ClipChainAV(io.ComfyNode):
     @classmethod
     def execute(cls, model, clip, vae, audio_vae, positive, latent, prompts,
                 segment_prompts=None,
+                segments_json="",
                 seeds="", base_seed=0, context_length=22, audio_context_length=0,
                 steps=8, sampler_name="euler", scheduler="simple", denoise=1.0,
 
@@ -1337,7 +1351,8 @@ class H3ClipChainAV(io.ComfyNode):
                 auto_first_frame="off",
                 no_subtitles=True):
 
-        # 1. 解析分段：优先使用 H3 Prompt Split 的每 clip 输入（Autogrow）
+        # 1. 解析分段：优先使用 H3 Prompt Split 的每 clip 输入（Autogrow），
+        #    其次 segments_json 单线（Split+Translate 九段输出），最后 prompts 文本框
         split_prompts = _collect_segment_prompts(segment_prompts)
         seg_source = "prompts 文本框"
         if split_prompts:
@@ -1346,6 +1361,10 @@ class H3ClipChainAV(io.ComfyNode):
             seg_source = "H3 Prompt Split 输入 (segment_prompts)"
             print(f"[H3ClipChain] 使用 H3 Prompt Split 输入: {len(clips)} 个 clip "
                   f"(每路=整段, 不按行拆分)", flush=True)
+        elif segments_json and str(segments_json).strip():
+            clips = _parse_clips(segments_json, seeds, base_seed)
+            seg_source = "segments_json 输入"
+            print(f"[H3ClipChain] 使用 segments_json 输入: {len(clips)} 个 clip", flush=True)
         else:
             if not prompts or not str(prompts).strip():
                 raise ValueError(
