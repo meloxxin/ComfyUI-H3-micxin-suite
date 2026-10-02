@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""H3PromptSplitTranslate (micxin) 测试：拆分 / 对话占位保护 / schema（4 段上限）。
+"""H3PromptSplitTranslate (micxin) 测试：拆分 / 对话占位保护 / schema（9 段上限 + segments_json）。
 
 不加载真实 GGUF，只测：_split_to_prompt_list 复用、引号对话占位往返、
 系统提示词规则、backend 默认 Local、execute 是 classmethod、GET_SCHEMA 校验。
@@ -36,6 +36,7 @@ from h3_ad.h3_prompt_split_translate import (  # noqa: E402
     _TRANSLATE_SYS,
     H3PromptSplitTranslate,
     MAX_SEGMENTS,
+    PROMPT_OUTPUTS,
     _split_segments,
     _batch_rewrite_segments,
     _ensure_subject_defs,
@@ -93,7 +94,7 @@ def test_split_json_array():
 # ---------------- schema ----------------
 
 @requires_comfy
-def test_schema_max_4_and_local_backend():
+def test_schema_max_9_and_local_backend():
     schema = H3PromptSplitTranslate.define_schema()
     assert schema.node_id == "H3PromptSplitTranslate"
 
@@ -106,10 +107,10 @@ def test_schema_max_4_and_local_backend():
 
     inputs = {_nm(inp): inp for inp in schema.inputs}
     assert inputs["backend"].default == "Local GGUF"
-    # 输出 = 4 路 prompt + report + width + height + length + fixed_json
+    # 输出 = segments_json + width + height + length + report（PROMPT_OUTPUTS=0，无独立 prompt 口）
     outs = schema.outputs
-    assert len(outs) == MAX_SEGMENTS + 5
-    assert MAX_SEGMENTS == 4
+    assert len(outs) == PROMPT_OUTPUTS + 5
+    assert MAX_SEGMENTS == 9
 
 
 @requires_comfy
@@ -122,12 +123,13 @@ def test_execute_is_classmethod_and_validates():
 def test_registered():
     import h3_ad.h3_prompt_split_translate as m
     assert "H3PromptSplitTranslate" in m.NODE_CLASS_MAPPINGS
-    # 旧 H3PromptTranslate 已从 __init__ 注册移除（合并进本节点）
+    # H3PromptWriter 保留（用户主力节点）；H3 Prompt Translate 已弃用删除
     init_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              "ComfyUI-H3-AutoDirector", "__init__.py")
     init_src = open(init_path, encoding="utf-8").read()
-    assert "h3_prompt_translate" not in init_src
     assert "h3_prompt_split_translate" in init_src
+    assert "from .h3_screenwriter" in init_src
+    assert "from .h3_prompt_translate" not in init_src
 
 # ---------------- 宽高长 + 参考图过图 ----------------
 
@@ -181,11 +183,10 @@ def test_schema_has_wh_and_aio_ref():
 
     outs = [getattr(o, "id", None) or getattr(o, "name", None) for o in schema.outputs]
     assert "width" in outs and "height" in outs and "length" in outs
-    # 顺序：prompt_0..3 → width/height/length → fixed_json → report（最后）
-    assert outs[:4] == ["prompt_0", "prompt_1", "prompt_2", "prompt_3"]
-    assert outs[4:7] == ["width", "height", "length"]
-    assert outs[7] == "fixed_json"
-    assert outs[8] == "report"  # report 放最后
+    # 顺序：segments_json → width/height/length → report（最后；无独立 prompt 口）
+    assert outs[0] == "segments_json"
+    assert outs[1:4] == ["width", "height", "length"]
+    assert outs[4] == "report"  # report 放最后
 
 # ---------------- 内嵌 H3PromptFix（raw_text → 修复 → 拆分） ----------------
 
@@ -224,9 +225,9 @@ def test_schema_has_raw_text_and_fixed_json_out():
     assert "prompts_json" not in inputs  # 已删除：外部 JSON 直接贴 raw_text（fix 会保留）
 
     outs = [getattr(o, "id", None) or getattr(o, "name", None) for o in schema.outputs]
-    assert outs[7] == "fixed_json"  # JSON 预览输出
-    assert outs[8] == "report"      # report 最后
-    assert len(outs) == 9
+    assert outs[0] == "segments_json"
+    assert outs[4] == "report"      # report 最后
+    assert len(outs) == 5
 
 # ---------------- 省显存 & 绕过 LLM ----------------
 
@@ -342,7 +343,7 @@ def test_rewrite_segment_fallback_to_translate():
 
 
 def test_rewrite_segment_exception_fallback():
-    """反推抛异常 → 也降级忠实翻译。"""
+    """反推/翻译抛异常 → 不再静默返回原文，向上抛出让节点报错可见。"""
     import h3_ad.h3_prompt_split_translate as m
 
     def boom(llm, messages, temperature, seed, max_tokens):
@@ -351,10 +352,10 @@ def test_rewrite_segment_exception_fallback():
     _orig = m._call_local_llm
     m._call_local_llm = boom
     try:
-        out = _rewrite_segment("summary: 中文段", llm="fake", temperature=0.4, seed=0)
+        with pytest.raises(RuntimeError, match="llm down"):
+            _rewrite_segment("summary: 中文段", llm="fake", temperature=0.4, seed=0)
     finally:
         m._call_local_llm = _orig
-    assert out == "summary: 中文段"  # 兜底：保留原文
 
 
 # ---------------- 写作增强规则（训练语料归纳注入 fullreference） ----------------
@@ -362,7 +363,7 @@ def test_rewrite_segment_exception_fallback():
 def test_fullreference_template_has_writing_enhancements():
     """fullreference 反推模板已注入写作增强：动作链/运镜五要素/微表演/参考图分工/
     跨段连续/音频分层/禁模糊词。"""
-    from h3_ad.h3_screenwriter import _build_system_prompt
+    from h3_ad.h3_llm_utils import _build_system_prompt
     sp = _build_system_prompt("fullreference")
     for marker in (
         "ACTION CHAIN", "CAMERA SPEC", "MICRO-ACTING",
@@ -374,7 +375,7 @@ def test_fullreference_template_has_writing_enhancements():
 
 def test_other_task_modes_not_enhanced():
     """非 fullreference 模板不动（不追加增强段），避免改变已验收行为。"""
-    from h3_ad.h3_screenwriter import _build_system_prompt
+    from h3_ad.h3_llm_utils import _build_system_prompt
     sp = _build_system_prompt("3d_animation")
     assert "ACTION CHAIN" not in sp
     assert "FORBIDDEN FILLER" not in sp
@@ -428,9 +429,9 @@ def test_split_segments_loose_markers():
     out = (
         "SEGMENT 1: subject_definitions: A.\n"
         "summary: s1.\n"
-        "\u3010\u6bb52\u3011 subject_definitions: B.\n"
+        "【段2】 subject_definitions: B.\n"
         "summary: s2.\n"
-        "\u6bb5 3: subject_definitions: C.\n"
+        "段 3: subject_definitions: C.\n"
         "summary: s3.\n"
     )
     segs = _split_segments(out, 3)
@@ -630,8 +631,8 @@ def test_translate_leftover_cn_mocks_llm():
 def test_quotes_to_d_blocks_basic():
     """裸引号中文台词 → <d>台词</d>（无方言标签）。"""
     from h3_ad.h3_prompt_split_translate import _quotes_to_d_blocks
-    text = ("The female lead whispers: \u201c你当初走嗰阵时，有冇谂过我会有几难过？\u201d "
-            "The male lead explains: \u201c我当时太懦弱。\u201d")
+    text = ("The female lead whispers: “你当初走嗰阵时，有冇谂过我会有几难过？” "
+            "The male lead explains: “我当时太懦弱。”")
     out = _quotes_to_d_blocks(text, 5.0)
     assert '<d>你当初走嗰阵时，有冇谂过我会有几难过？</d>' in out
     assert '<d>我当时太懦弱。</d>' in out
@@ -641,10 +642,10 @@ def test_quotes_to_d_blocks_keeps_existing_d():
     """已有 <d> 块（反推输出）原样保留，不重复包。"""
     from h3_ad.h3_prompt_split_translate import _quotes_to_d_blocks
     text = ("detailed_description: scene at night. "
-            "<d>00:00-00:03 (S1): \u201c你有冇搞错啊？\u201d</d> "
-            "The woman says: \u201c你凭什么删我东西……\u201d done.")
+            "<d>00:00-00:03 (S1): “你有冇搞错啊？”</d> "
+            "The woman says: “你凭什么删我东西……” done.")
     out = _quotes_to_d_blocks(text, 5.0)
-    assert '<d>00:00-00:03 (S1): \u201c你有冇搞错啊？\u201d</d>' in out
+    assert '<d>00:00-00:03 (S1): “你有冇搞错啊？”</d>' in out
     assert '<d>你凭什么删我东西……</d>' in out
 
 
@@ -654,5 +655,5 @@ def test_quotes_to_d_blocks_english_untouched():
     text = ('subject_definitions: "The reference image <Picture 1> defines her '
             'facial features, hair style, and body proportions."')
     assert _quotes_to_d_blocks(text, 5.0) == text
-    assert _quotes_to_d_blocks('No Chinese here: \u201chello\u201d', 5.0) == \
-        'No Chinese here: \u201chello\u201d'
+    assert _quotes_to_d_blocks('No Chinese here: “hello”', 5.0) == \
+        'No Chinese here: “hello”'
