@@ -108,7 +108,7 @@ Format: <Label N> (appears in [Shot ...]): marker - brief note.
 ## 5. detailed_description
 The main body. Describe visuals, actions, sound, and dialogue shot by shot in playback order; insert reference labels where they apply.
 - Write the body in English; preserve original language of dialogue, lyrics, and visible text.
-- [Shot 1] has no timestamp; later shots use [Shot N] At MM:SS.mmm, (timestamps strictly increasing, within duration).
+- Timestamps are OPTIONAL. If used, write "[Shot N] At MM:SS.mmm," with strictly increasing times that MUST span the ENTIRE total duration: the LAST shot's timestamp must sit near the end of the clip and its action must continue to the very end. NEVER end the timeline early - beats stopping at 3-4s of a 10s clip is a FAILURE. Omit timestamps entirely when unsure; shots then flow sequentially across the full duration.
 - Establish the visual style in one or two English sentences BEFORE [Shot 1] (e.g., Cinematic / live-action / 2D-animated / 3D CG / claymation / watercolor / vintage film, or described specifically).
 - At the first clear appearance of an important <Subject N>, describe its referenced characteristics, frame position, and current action within what is actually visible. Continue using the same label later without redefining it.
 - For concrete frame anchors use natural phrasing: "the shot begins from <Picture 1>", "the shot's keyframe corresponds to <Picture 2>", "the shot ends on <Picture 3>".
